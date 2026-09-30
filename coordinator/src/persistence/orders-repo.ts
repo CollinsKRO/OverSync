@@ -167,11 +167,21 @@ export class OrdersRepository {
     `);
     this.byPublicId = db.prepare("SELECT * FROM orders WHERE public_id = ?");
     this.byHashlock = db.prepare("SELECT * FROM orders WHERE hashlock = ?");
+    // Keyset pagination. `created_at` is only second-resolution, so `public_id`
+    // is the tiebreaker that makes the ordering total — without it, rows
+    // sharing a second get dropped between pages or repeated. `OFFSET` is
+    // deliberately not used: a row inserted mid-pagination would shift the
+    // window and hide an existing order.
     this.byAddress = db.prepare(`
       SELECT * FROM orders
-      WHERE src_address = :addr OR dst_address = :addr
-      ORDER BY created_at DESC
-      LIMIT :limit OFFSET :offset
+      WHERE (src_address = :addr OR dst_address = :addr)
+        AND (
+          :hasCursor = 0
+          OR created_at < :cursorCreatedAt
+          OR (created_at = :cursorCreatedAt AND public_id < :cursorPublicId)
+        )
+      ORDER BY created_at DESC, public_id DESC
+      LIMIT :limit
     `);
     this.bySrcOrderId = db.prepare(`
       SELECT * FROM orders WHERE src_chain = :chain AND src_order_id = :orderId
@@ -281,8 +291,25 @@ export class OrdersRepository {
     return row ? rowToOrder(row) : null;
   }
 
-  async findByAddress(addr: string, limit = 50, offset = 0): Promise<OrderRow[]> {
-    const rows = await this.all<OrderDbRow>(this.byAddress, { addr, limit, offset });
+  /**
+   * One page of an address's order history, newest first.
+   *
+   * Pass `before` to continue from a previous page's last row. Rows strictly
+   * older than that keyset are returned, so an order inserted after the first
+   * page was served cannot push an already-seen order off the end.
+   */
+  async findByAddressPage(
+    addr: string,
+    limit: number,
+    before?: { createdAt: number; publicId: string }
+  ): Promise<OrderRow[]> {
+    const rows = await this.all<OrderDbRow>(this.byAddress, {
+      addr,
+      limit,
+      hasCursor: before ? 1 : 0,
+      cursorCreatedAt: before?.createdAt ?? 0,
+      cursorPublicId: before?.publicId ?? ""
+    });
     return rows.map(rowToOrder);
   }
 

@@ -1,7 +1,40 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import { z } from "zod";
 import type { OrderRow } from "../../persistence/orders-repo.js";
 import { announceSchema, OrderService, OrderValidationError } from "../../services/order-service.js";
+import {
+  encodeHistoryCursor,
+  validateHistoryCursor,
+  type HistoryCursor
+} from "./cursor-utils.js";
+
+export interface OrdersRouteOptions {
+  /**
+   * Deployment network cursors are bound to. Defaults to `NETWORK_MODE`.
+   * A cursor minted by a testnet coordinator is rejected on mainnet.
+   */
+  network?: "testnet" | "mainnet";
+}
+
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
+
+function defaultNetwork(): "testnet" | "mainnet" {
+  return process.env.NETWORK_MODE === "mainnet" ? "mainnet" : "testnet";
+}
+
+/**
+ * The history route accepts the address as `address`, and also under `eth` /
+ * `stellar` for clients that only ever hold one of the two.
+ */
+function readHistoryAddress(query: Request["query"]): string {
+  const candidates = [query.address, query.eth, query.stellar];
+  for (const candidate of candidates) {
+    const value = typeof candidate === "string" ? candidate.trim() : "";
+    if (value) return value;
+  }
+  return "";
+}
 
 function serialiseOrder(order: OrderRow | null) {
   if (!order) return null;
@@ -42,8 +75,9 @@ function serialiseOrder(order: OrderRow | null) {
   };
 }
 
-export function ordersRoutes(orders: OrderService): Router {
+export function ordersRoutes(orders: OrderService, options: OrdersRouteOptions = {}): Router {
   const router = Router();
+  const network = options.network ?? defaultNetwork();
 
   router.post("/orders/announce", async (req, res, next) => {
     try {
@@ -63,6 +97,77 @@ export function ordersRoutes(orders: OrderService): Router {
     }
   });
 
+  router.get("/orders/history", async (req, res, next) => {
+    const address = readHistoryAddress(req.query);
+    if (!address) {
+      res.status(400).json({ error: "address_required" });
+      return;
+    }
+
+    // A client that declares its network must be talking to a coordinator
+    // running on that network. History rows are not comparable across them.
+    const declaredNetwork = req.query.network;
+    if (declaredNetwork !== undefined && declaredNetwork !== network) {
+      res.status(400).json({
+        error: "network_mismatch",
+        message: `This coordinator serves ${network}, not ${String(declaredNetwork)}`
+      });
+      return;
+    }
+
+    const rawLimit = req.query.limit === undefined ? DEFAULT_LIMIT : Number(req.query.limit);
+    if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > MAX_LIMIT) {
+      res.status(400).json({
+        error: "invalid_limit",
+        message: `limit must be an integer between 1 and ${MAX_LIMIT}`
+      });
+      return;
+    }
+    const limit = rawLimit;
+
+    // The cursor is the only thing that decides where page N+1 starts. It is
+    // validated against this request before it can reach the query layer, so a
+    // cursor from another user or another network is a hard error rather than
+    // a silently short page.
+    let before: Pick<HistoryCursor, "createdAt" | "publicId"> | undefined;
+    const cursorParam = req.query.cursor;
+    if (cursorParam !== undefined) {
+      const validation = validateHistoryCursor(cursorParam, { user: address, network });
+      if (!validation.ok) {
+        res.status(400).json({ error: "invalid_cursor", reason: validation.reason, message: validation.message });
+        return;
+      }
+      before = { createdAt: validation.cursor.createdAt, publicId: validation.cursor.publicId };
+    }
+
+    try {
+      // Fetch one extra row to learn whether another page exists. Guessing from
+      // `count === limit` would leave a "Load More" button pointing at an
+      // empty page.
+      const rows = await orders.history(address, limit + 1, before);
+      const hasMore = rows.length > limit;
+      const page = hasMore ? rows.slice(0, limit) : rows;
+      const last = page[page.length - 1];
+
+      const nextCursor =
+        hasMore && last
+          ? encodeHistoryCursor({
+              createdAt: last.createdAt,
+              publicId: last.publicId,
+              user: address,
+              network
+            })
+          : null;
+
+      res.json({
+        transactions: page.map((o) => serialiseOrder(o)).filter(Boolean),
+        pagination: { limit, count: page.length, hasMore, nextCursor }
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   router.get("/orders/:id", async (req, res, next) => {
     const id = req.params.id;
     try {
@@ -72,25 +177,6 @@ export function ordersRoutes(orders: OrderService): Router {
         return;
       }
       res.json(serialiseOrder(order));
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  router.get("/orders/history", async (req, res, next) => {
-    const address = (req.query.address as string | undefined) ?? "";
-    if (!address) {
-      res.status(400).json({ error: "address_required" });
-      return;
-    }
-    const limit = Math.min(Number(req.query.limit ?? 50), 200);
-    const offset = Math.max(Number(req.query.offset ?? 0), 0);
-    try {
-      const list = await orders.history(address, limit, offset);
-      res.json({
-        transactions: list.map((o) => serialiseOrder(o)).filter(Boolean),
-        pagination: { limit, offset, count: list.length }
-      });
     } catch (err) {
       next(err);
     }

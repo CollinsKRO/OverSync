@@ -16,6 +16,9 @@ const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const STELLAR_ADDRESS = /^G[A-Z2-7]{55}$/;
 
+/** Page size used when a caller asks for history without naming a limit. */
+const DEFAULT_HISTORY_LIMIT = 50;
+
 export const announceSchema = z.object({
   direction: z.enum(["eth_to_xlm", "xlm_to_eth"]),
   hashlock: z.string().regex(HEX32, "hashlock must be 0x + 64 hex chars"),
@@ -129,8 +132,17 @@ export class OrderService {
     return this.repo.findByPublicId(publicId);
   }
 
-  history(address: string, limit?: number, offset?: number): Promise<OrderRow[]> {
-    return this.repo.findByAddress(address, limit, offset);
+  /**
+   * Cursor-based history page. `before` is the validated keyset from the
+   * previous page; omit it for the first page. `limit` defaults to a full page
+   * so a bare `history(address)` still works for non-paginated callers.
+   */
+  history(
+    address: string,
+    limit = DEFAULT_HISTORY_LIMIT,
+    before?: { createdAt: number; publicId: string }
+  ): Promise<OrderRow[]> {
+    return this.repo.findByAddressPage(address, limit, before);
   }
 
   findByHashlock(hashlock: string): Promise<OrderRow | null> {
