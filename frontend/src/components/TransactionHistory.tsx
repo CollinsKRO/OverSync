@@ -16,10 +16,9 @@ import {
 import type { Address } from 'viem';
 import HtlcTimeline from './HtlcTimeline';
 import {
-  fetchCoordinatorOrders,
   isRealHash,
   isRealTransaction,
-  mergeTransactions,
+  mapCoordinatorOrderToTransaction,
   type Transaction,
 } from '../lib/orderRecovery';
 
@@ -114,12 +113,6 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
       commitTransactions(loadFromStorage());
       setNextCursor(null);
       setHistoryError(null);
-
-  const refreshFromCoordinator = useCallback(async () => {
-    const local = loadFromStorage();
-    if (!ethAddress && !stellarAddress) {
-      setTransactions(local);
-
       return;
     }
 
@@ -170,15 +163,6 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
       // user can tell the difference between "no more orders" and "we lost the
       // cursor". Only a failed first page falls back to the local cache.
       if (cursor === null) commitTransactions(loadFromStorage());
-
-      const remote = await fetchCoordinatorOrders(API_BASE_URL, { ethAddress, stellarAddress });
-      const merged = mergeTransactions(local, remote);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
-      setTransactions(merged);
-    } catch (err) {
-      console.warn('Coordinator history unavailable, falling back to local cache:', err);
-      setTransactions(local);
-
     } finally {
       setIsLoading(false);
     }

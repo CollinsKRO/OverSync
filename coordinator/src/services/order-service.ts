@@ -195,12 +195,10 @@ export class OrderService {
     before?: { createdAt: number; publicId: string }
   ): Promise<OrderRow[]> {
     return this.repo.findByAddressPage(address, limit, before);
-  getTransitions(publicId: string): Promise<OrderTransitionSummary[]> {
-    return this.repo.getTransitions(publicId);
   }
 
-  history(address: string, limit?: number, offset?: number): Promise<OrderRow[]> {
-    return this.repo.findByAddress(address, limit, offset);
+  getTransitions(publicId: string): Promise<OrderTransitionSummary[]> {
+    return this.repo.getTransitions(publicId);
   }
 
   findByHashlock(hashlock: string): Promise<OrderRow | null> {

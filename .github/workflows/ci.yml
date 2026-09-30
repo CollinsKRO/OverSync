@@ -94,14 +94,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned deliberately. `@stable` resolves to a toolchain that rejects
+      # ethnum 1.5.0 (pinned by stellar-cli 22.8.1's own lockfile, which we keep
+      # via --locked): rustc nightly-2026-04-18 grew `TryFromIntError` from 0 to
+      # 1 byte, so ethnum's `transmute(())` fails with E0512.
+      #
+      # The floor is 1.84, the first release with the `wasm32v1-none` target
+      # that `stellar contract build` requires. Staying below ~1.97 keeps the
+      # `TryFromIntError` layout ethnum expects.
+      #
+      # To move off this pin: upgrade stellar-cli past 22.8.1 to a release whose
+      # lockfile uses ethnum >= 1.5.3, then return to `@stable`.
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.86.0
           targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Install Stellar CLI
         run: |
-          cargo install --locked stellar-cli --version 22.8.1 || true
+          cargo install --locked stellar-cli --version 22.8.1
           stellar --version
 
       - name: Cache cargo

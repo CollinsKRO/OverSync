@@ -16,8 +16,10 @@ export interface OrdersRouteOptions {
   network?: "testnet" | "mainnet";
 }
 
-const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 100;
+// Page-size contract is unchanged from the offset-based route this replaced;
+// only the cursor semantics moved to a keyset.
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 200;
 
 function defaultNetwork(): "testnet" | "mainnet" {
   return process.env.NETWORK_MODE === "mainnet" ? "mainnet" : "testnet";
@@ -34,8 +36,7 @@ function readHistoryAddress(query: Request["query"]): string {
     if (value) return value;
   }
   return "";
-
-import { encodeCursor, decodeCursor } from "./cursor-utils.js";
+}
 
 function orderValidationResponse(err: OrderValidationError): { status: number; body: Record<string, unknown> } {
   if (err.code === "TIMELOCKS_REVERSED" || err.code === "GAP_TOO_SMALL") {
@@ -107,62 +108,6 @@ export function ordersRoutes(orders: OrderService, options: OrdersRouteOptions =
   });
 
   // IMPORTANT: Specific routes must come BEFORE parameterized routes
-  router.get("/orders/history", async (req, res, next) => {
-    const address = (req.query.address as string | undefined) ?? "";
-    if (!address) {
-      res.status(400).json({ error: "address_required" });
-      return;
-    }
-
-    // Validate and parse limit
-    const limitStr = req.query.limit as string | undefined;
-    const limit = limitStr ? Number(limitStr) : 50;
-    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
-      res.status(400).json({ error: "invalid_limit", message: "limit must be an integer between 1 and 200" });
-      return;
-    }
-
-    // Validate and decode cursor (optional)
-    let offset = 0;
-    const cursorStr = req.query.cursor as string | undefined;
-    if (cursorStr) {
-      const decoded = decodeCursor(cursorStr);
-      if (!decoded) {
-        res.status(400).json({ error: "invalid_cursor", message: "cursor is malformed or expired" });
-        return;
-      }
-      offset = decoded.offset;
-    }
-
-    try {
-      // Fetch limit + 1 to detect if more rows exist
-      const list = await orders.history(address, limit + 1, offset);
-      const hasMore = list.length > limit;
-      const rows = hasMore ? list.slice(0, limit) : list;
-
-      // Generate next cursor if there are more rows
-      let nextCursor: string | null = null;
-      if (hasMore && rows.length > 0) {
-        const lastRow = rows[rows.length - 1];
-        if (lastRow) {
-          nextCursor = encodeCursor({ offset: offset + limit, createdAt: lastRow.createdAt });
-        }
-      }
-
-      res.json({
-        transactions: rows.map((o) => serialiseOrder(o)).filter(Boolean),
-        pagination: {
-          limit,
-          cursor: cursorStr ?? null,
-          nextCursor,
-          hasMore
-        }
-      });
-    } catch (err) {
-      next(err);
-    }
-  });
-
   router.get("/orders/snapshot", async (_req, res, next) => {
     try {
       const snapshots = await orders.getSnapshots();
@@ -271,14 +216,6 @@ export function ordersRoutes(orders: OrderService, options: OrdersRouteOptions =
     }
   });
 
-  router.get("/orders/:id/transitions", async (req, res, next) => {
-    try {
-      const transitions = await orders.getTransitions(req.params.id);
-      res.json({ transitions });
-    } catch (err) {
-      next(err);
-    }
-  });
   const lockSchema = z.object({
     orderId: z.string().min(1),
     txHash: z.string().min(1),

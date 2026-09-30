@@ -98,7 +98,7 @@ beforeEach(async () => {
   const orders = new OrderService(new OrdersRepository(db), log);
   app = createApp({
     log,
-    corsOrigin: "*",
+    corsOrigins: ["*"],
     maxRequestBodyBytes: 65_536,
     network: "testnet",
     orders,
@@ -288,7 +288,7 @@ describe("GET /api/orders/history — invalid cursors", () => {
   });
 
   it("rejects an out-of-range limit", async () => {
-    for (const limit of ["0", "-1", "101", "abc", "1.5"]) {
+    for (const limit of ["0", "-1", "201", "abc", "1.5"]) {
       const res = await request(app)
         .get("/api/orders/history")
         .query({ address: USER, limit });
