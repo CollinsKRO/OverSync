@@ -1,5 +1,4 @@
 import express, { type Express } from "express";
-import cors from "cors";
 import pinoHttp from "pino-http";
 import type { Logger } from "pino";
 import { healthRoutes } from "./routes/health.js";
@@ -8,13 +7,14 @@ import { httpRequestDuration } from "../metrics.js";
 import { ordersRoutes } from "./routes/orders.js";
 import { secretsRoutes } from "./routes/secrets.js";
 import { quotesRoutes } from "./routes/quotes.js";
+import { createCorsMiddleware } from "./cors.js";
 import type { OrderService } from "../services/order-service.js";
 import type { SecretService } from "../services/secret-service.js";
 import type { QuoteService } from "../services/quote-service.js";
 
 export interface AppDeps {
   log: Logger;
-  corsOrigin: string;
+  corsOrigins: string[];
   /** Maximum allowed JSON request body size in bytes. Default: 65536 (64 KiB). */
   maxRequestBodyBytes: number;
   orders: OrderService;
@@ -28,14 +28,8 @@ export function createApp(deps: AppDeps): Express {
   const { maxRequestBodyBytes } = deps;
   const app = express();
   app.use(pinoHttp({ logger: deps.log }));
-  // Reject bodies exceeding the configured limit before any route logic runs.
   app.use(express.json({ limit: maxRequestBodyBytes }));
-  app.use(
-    cors({
-      origin: deps.corsOrigin === "*" ? true : deps.corsOrigin.split(","),
-      credentials: true
-    })
-  );
+  app.use(createCorsMiddleware(deps.corsOrigins));
 
   // Prometheus HTTP duration instrumentation
   app.use((req, res, next) => {
@@ -47,13 +41,14 @@ export function createApp(deps: AppDeps): Express {
     next();
   });
 
-  app.use(healthRoutes());
+  const readinessLimit = Number(process.env.COORDINATOR_READINESS_RATE_LIMIT ?? 30);
+  const readinessWindowMs = Number(process.env.COORDINATOR_READINESS_RATE_WINDOW_MS ?? 60_000);
+  app.use(healthRoutes({ limit: readinessLimit, windowMs: readinessWindowMs }));
   app.use(metricsRoutes());
   app.use("/api", ordersRoutes(deps.orders, { network: deps.network }));
   app.use("/api", secretsRoutes(deps.secrets));
   app.use("/api", quotesRoutes(deps.quotes));
   app.use("/api", orderMetricsRoutes(deps.orders));
-
   // 413 / 400 handler — catches oversized request bodies and malformed JSON before the generic error handler.
   app.use(
     (

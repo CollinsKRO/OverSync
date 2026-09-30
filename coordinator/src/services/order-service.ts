@@ -3,16 +3,24 @@ import { z } from "zod";
 import {
   OrdersRepository,
   type OrderRow,
+  type OrderSnapshot,
   type AnnounceOrderInput,
   type OrderMetrics,
+  type OrderTransitionSummary,
   type Direction,
   type Chain
 } from "../persistence/orders-repo.js";
 import { canTransition } from "../state-machine/order-machine.js";
 import { ordersTotal } from "../metrics.js";
 import { QuoteService, QuoteExpiredError, QuoteNotFoundError } from "./quote-service.js";
+import { loadConfig } from "../config.js";
+import {
+  validateTimelocksAtCreation,
+  type TimelockValidationError
+} from "../utils/timelock-validator.js";
 
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
+const ZERO_HASHLOCK = "0x" + "0".repeat(64);
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const STELLAR_ADDRESS = /^G[A-Z2-7]{55}$/;
 
@@ -21,7 +29,10 @@ const DEFAULT_HISTORY_LIMIT = 50;
 
 export const announceSchema = z.object({
   direction: z.enum(["eth_to_xlm", "xlm_to_eth"]),
-  hashlock: z.string().regex(HEX32, "hashlock must be 0x + 64 hex chars"),
+  hashlock: z.string().regex(HEX32, "hashlock must be 0x + 64 hex chars").refine(
+    (v) => v.toLowerCase() !== ZERO_HASHLOCK.toLowerCase(),
+    "hashlock must not be all zeros"
+  ),
   srcChain: z.enum(["ethereum", "stellar"]),
   srcAddress: z.string(),
   srcAsset: z.string().min(1),
@@ -42,7 +53,38 @@ export const announceSchema = z.object({
 
 export type AnnounceInput = z.infer<typeof announceSchema>;
 
-export class OrderValidationError extends Error {}
+export class OrderValidationError extends Error {
+  readonly code?: TimelockValidationError;
+
+  constructor(message: string, code?: TimelockValidationError) {
+    super(message);
+    this.name = "OrderValidationError";
+    this.code = code;
+  }
+}
+
+function assertTimelocksAtCreation(
+  srcTimelock: number,
+  dstTimelock: number,
+  minGapSeconds: number
+): void {
+  const validation = validateTimelocksAtCreation(srcTimelock, dstTimelock, minGapSeconds);
+  if (!validation.isValid && validation.error) {
+    const message =
+      validation.error === "TIMELOCKS_REVERSED"
+        ? "Destination timelock must be strictly before source timelock"
+        : "Timelock gap between source and destination is below the minimum safety gap";
+    throw new OrderValidationError(message, validation.error);
+  }
+}
+
+/** A chain event was validly shaped but older than the persisted state. */
+export class StaleOrderEventError extends OrderValidationError {
+  constructor(message: string) {
+    super(message);
+    this.name = "StaleOrderEventError";
+  }
+}
 
 function validateChainAddress(chain: Chain, addr: string): void {
   if (chain === "ethereum" && !HEX_ADDRESS.test(addr)) {
@@ -67,12 +109,17 @@ function validateDirectionAgainstChains(input: AnnounceInput): void {
 }
 
 export class OrderService {
+  private readonly minGapSeconds: number;
+
   constructor(
     private readonly repo: OrdersRepository,
     private readonly log: Logger,
     /** Optional — when supplied, quoteId in announce requests is validated. */
-    private readonly quoteService?: QuoteService
-  ) {}
+    private readonly quoteService?: QuoteService,
+    config?: ReturnType<typeof loadConfig>
+  ) {
+    this.minGapSeconds = config?.timelockSafetyGapSeconds ?? 600;
+  }
 
   /**
    * Record a new order announcement. The coordinator does NOT lock any
@@ -90,6 +137,12 @@ export class OrderService {
     validateChainAddress(input.srcChain, input.srcAddress);
     validateChainAddress(input.dstChain, input.dstAddress);
     validateDirectionAgainstChains(input);
+
+    if (input.hashlock.toLowerCase() === ZERO_HASHLOCK.toLowerCase()) {
+      throw new OrderValidationError("hashlock must not be all zeros");
+    }
+
+    const hashlock = input.hashlock.toLowerCase() as `0x${string}`;
 
     // --- Quote freshness gate -------------------------------------------
     if (input.quoteId) {
@@ -110,16 +163,16 @@ export class OrderService {
     }
     // -------------------------------------------------------------------
 
-    const existing = await this.repo.findByHashlock(input.hashlock);
+    const existing = await this.repo.findByHashlock(hashlock);
     if (existing) {
       throw new OrderValidationError(
-        `An order with hashlock ${input.hashlock} already exists (publicId=${existing.publicId})`
+        `An order with hashlock ${hashlock} already exists (publicId=${existing.publicId})`
       );
     }
 
     // Strip quoteId — it's not a persisted column, just a freshness gate.
     const { quoteId: _q, ...repoInput } = input;
-    const order = await this.repo.announce(repoInput as AnnounceOrderInput);
+    const order = await this.repo.announce({ ...repoInput, hashlock } as AnnounceOrderInput);
     this.log.info(
       { publicId: order.publicId, direction: order.direction, quoteId: input.quoteId ?? null },
       "order announced"
@@ -131,7 +184,6 @@ export class OrderService {
   get(publicId: string): Promise<OrderRow | null> {
     return this.repo.findByPublicId(publicId);
   }
-
   /**
    * Cursor-based history page. `before` is the validated keyset from the
    * previous page; omit it for the first page. `limit` defaults to a full page
@@ -143,10 +195,20 @@ export class OrderService {
     before?: { createdAt: number; publicId: string }
   ): Promise<OrderRow[]> {
     return this.repo.findByAddressPage(address, limit, before);
+  getTransitions(publicId: string): Promise<OrderTransitionSummary[]> {
+    return this.repo.getTransitions(publicId);
+  }
+
+  history(address: string, limit?: number, offset?: number): Promise<OrderRow[]> {
+    return this.repo.findByAddress(address, limit, offset);
   }
 
   findByHashlock(hashlock: string): Promise<OrderRow | null> {
     return this.repo.findByHashlock(hashlock);
+  }
+
+  findByPreimage(preimage: string): Promise<OrderRow | null> {
+    return this.repo.findByPreimage(preimage);
   }
 
   async recordSrcLock(input: {
@@ -158,9 +220,23 @@ export class OrderService {
   }): Promise<void> {
     const order = await this.repo.findByPublicId(input.publicId);
     if (!order) throw new OrderValidationError(`unknown order ${input.publicId}`);
-    if (!canTransition(order.status, "src_locked") && order.status !== "src_locked") {
-      throw new OrderValidationError(`cannot record src lock from status ${order.status}`);
+    if (order.status === "src_locked") {
+      const sameEvent =
+        order.srcOrderId === input.orderId &&
+        order.srcLockTx === input.txHash &&
+        order.srcLockBlock === input.blockNumber &&
+        order.srcTimelock === input.timelock;
+      if (sameEvent) return;
+      throw new StaleOrderEventError(`conflicting src lock event for ${input.publicId}`);
     }
+    if (!canTransition(order.status, "src_locked")) {
+      throw new StaleOrderEventError(`stale src lock event for order in status ${order.status}`);
+    }
+
+    if (order.dstTimelock != null) {
+      assertTimelocksAtCreation(input.timelock, order.dstTimelock, this.minGapSeconds);
+    }
+
     await this.repo.recordSrcLock(input);
     this.log.info({ publicId: input.publicId, srcOrderId: input.orderId }, "src lock recorded");
     ordersTotal.inc({ status: "src_locked" });
@@ -176,9 +252,24 @@ export class OrderService {
   }): Promise<void> {
     const order = await this.repo.findByPublicId(input.publicId);
     if (!order) throw new OrderValidationError(`unknown order ${input.publicId}`);
-    if (!canTransition(order.status, "dst_locked") && order.status !== "dst_locked") {
-      throw new OrderValidationError(`cannot record dst lock from status ${order.status}`);
+    if (order.status === "dst_locked") {
+      const sameEvent =
+        order.dstOrderId === input.orderId &&
+        order.dstLockTx === input.txHash &&
+        order.dstLockBlock === input.blockNumber &&
+        order.dstTimelock === input.timelock &&
+        order.resolverAddress === input.resolver;
+      if (sameEvent) return;
+      throw new StaleOrderEventError(`conflicting dst lock event for ${input.publicId}`);
     }
+    if (!canTransition(order.status, "dst_locked")) {
+      throw new StaleOrderEventError(`stale dst lock event for order in status ${order.status}`);
+    }
+
+    if (order.srcTimelock != null) {
+      assertTimelocksAtCreation(order.srcTimelock, input.timelock, this.minGapSeconds);
+    }
+
     await this.repo.recordDstLock(input);
     this.log.info({ publicId: input.publicId, dstOrderId: input.orderId }, "dst lock recorded");
     ordersTotal.inc({ status: "dst_locked" });
@@ -187,8 +278,12 @@ export class OrderService {
   async recordSecret(publicId: string, preimage: string, txHash: string): Promise<void> {
     const order = await this.repo.findByPublicId(publicId);
     if (!order) throw new OrderValidationError(`unknown order ${publicId}`);
-    if (!canTransition(order.status, "secret_revealed") && order.status !== "secret_revealed") {
-      throw new OrderValidationError(`cannot record secret from status ${order.status}`);
+    if (order.status === "secret_revealed") {
+      if (order.preimage === preimage && order.secretRevealedTx === txHash) return;
+      throw new StaleOrderEventError(`conflicting secret event for ${publicId}`);
+    }
+    if (!canTransition(order.status, "secret_revealed")) {
+      throw new StaleOrderEventError(`stale secret event for order in status ${order.status}`);
     }
     await this.repo.recordSecretRevealed({ publicId, preimage, txHash });
     this.log.info({ publicId }, "secret recorded");
@@ -208,5 +303,9 @@ export class OrderService {
     await this.repo.setStatus(publicId, status);
     this.log.info({ publicId, status }, "status updated");
     ordersTotal.inc({ status });
+  }
+
+  async getSnapshots(): Promise<OrderSnapshot[]> {
+    return this.repo.getCompletedOrderSnapshots();
   }
 }

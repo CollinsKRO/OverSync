@@ -15,38 +15,13 @@ import {
 } from '../lib/orderHistoryCursor';
 import type { Address } from 'viem';
 import HtlcTimeline from './HtlcTimeline';
-
-interface Transaction {
-  id: string;
-  txHash: string;
-  fromNetwork: string;
-  toNetwork: string;
-  fromToken: string;
-  toToken: string;
-  amount: string;
-  estimatedAmount: string;
-  status: 'pending' | 'completed' | 'cancelled' | 'failed';
-  timestamp: number;
-  ethTxHash?: string;
-  stellarTxHash?: string;
-  ethAddress?: string;
-  stellarAddress?: string;
-  direction: 'eth-to-xlm' | 'xlm-to-eth';
-  // Refund support
-  // ETH-side refund metadata (eth-to-xlm; populated when ETH is locked on-chain)
-  onChainOrderId?: string;       // bytes32 hex (v1) or uint256 string (v2)
-  htlcContractAddress?: string;  // contract holding the locked ETH
-  htlcContractMode?: 'v1-mainnet-htlc' | 'v2-escrow';
-  timelockUnixSeconds?: number;
-  amountWei?: string;
-  // Generic refund tracking (works for both directions)
-  refundTxHash?: string;
-  refundNetwork?: 'ethereum' | 'stellar';  // which chain the refund lives on
-  refundedAt?: number;
-  autoRefundFailed?: boolean;
-  autoRefundError?: string;
-  networkMode?: 'mainnet' | 'testnet';
-}
+import {
+  fetchCoordinatorOrders,
+  isRealHash,
+  isRealTransaction,
+  mergeTransactions,
+  type Transaction,
+} from '../lib/orderRecovery';
 
 interface TransactionHistoryProps {
   ethAddress?: string;
@@ -60,89 +35,9 @@ const API_BASE_URL = import.meta.env.PROD
   ? ''
   : (import.meta as any).env?.VITE_API_BASE_URL || PRODUCTION_API_BASE_URL;
 
-// Hash patterns that indicate fabricated/demo data, used to filter out legacy entries
-// persisted by older builds. New entries can never match these because v2 only stores
-// real on-chain hashes returned from the coordinator.
-const KNOWN_FAKE_HASHES = new Set([
-  '0x1234567890abcdef1234567890abcdef12345678',
-  '0xabcdef1234567890abcdef1234567890abcdef12',
-  '0x9876543210fedcba9876543210fedcba98765432',
-  '0x0000000000000000000000000000000000000000000000000000000000000000',
-  '0x0000000000000000000000000000000000000000',
-]);
-
-function isRealHash(hash?: string): boolean {
-  if (!hash) return true;
-  if (KNOWN_FAKE_HASHES.has(hash)) return false;
-  if (hash.startsWith('mock_')) return false;
-  if (hash.startsWith('placeholder')) return false;
-  if (/^0x0+$/.test(hash)) return false;
-  return true;
-}
-
-function isRealTransaction(tx: Transaction): boolean {
-  return isRealHash(tx.txHash) && isRealHash(tx.ethTxHash) && isRealHash(tx.stellarTxHash);
-}
-
 const isTestnetTx = (tx: Transaction): boolean => {
   return tx.networkMode === 'testnet' || (tx.networkMode === undefined && isTestnet());
 };
-
-function mapCoordinatorOrderToTransaction(order: any): Transaction {
-  if (order.fromToken || order.fromNetwork) {
-    return order as Transaction;
-  }
-
-  const isEthToXlm = order.direction === 'eth_to_xlm' || order.direction === 'eth-to-xlm';
-  const isTestnetMode = isTestnet();
-
-  let status: Transaction['status'] = 'pending';
-  if (order.status === 'completed') {
-    status = 'completed';
-  } else if (order.status === 'failed' || order.status === 'expired') {
-    status = 'failed';
-  } else if (order.status === 'refunded') {
-    status = 'cancelled';
-  }
-
-  const srcAmount = order.src?.amount
-    ? (isEthToXlm ? parseFloat(order.src.amount) / 1e18 : parseFloat(order.src.amount) / 1e7).toString()
-    : '0';
-  const dstAmount = order.dst?.amount
-    ? (isEthToXlm ? parseFloat(order.dst.amount) / 1e7 : parseFloat(order.dst.amount) / 1e18).toString()
-    : '0';
-
-  return {
-    id: order.id,
-    txHash: order.src?.lockTx || order.id,
-    fromNetwork: isEthToXlm
-      ? (isTestnetMode ? 'ETH Sepolia' : 'ETH Mainnet')
-      : (isTestnetMode ? 'Stellar Testnet' : 'Stellar Mainnet'),
-    toNetwork: isEthToXlm
-      ? (isTestnetMode ? 'Stellar Testnet' : 'Stellar Mainnet')
-      : (isTestnetMode ? 'ETH Sepolia' : 'ETH Mainnet'),
-    fromToken: isEthToXlm ? 'ETH' : 'XLM',
-    toToken: isEthToXlm ? 'XLM' : 'ETH',
-    amount: srcAmount,
-    estimatedAmount: dstAmount,
-    status,
-    timestamp: order.createdAt ? order.createdAt * 1000 : Date.now(),
-    ethTxHash: isEthToXlm ? order.src?.lockTx : order.dst?.lockTx,
-    stellarTxHash: isEthToXlm ? order.dst?.lockTx : order.src?.lockTx,
-    ethAddress: isEthToXlm ? order.src?.address : order.dst?.address,
-    stellarAddress: isEthToXlm ? order.dst?.address : order.src?.address,
-    direction: isEthToXlm ? 'eth-to-xlm' : 'xlm-to-eth',
-    onChainOrderId: order.src?.orderId,
-    htlcContractAddress: order.src?.chain === 'ethereum' ? order.resolver : undefined,
-    htlcContractMode: order.src?.safetyDeposit ? 'v2-escrow' : 'v1-mainnet-htlc',
-    timelockUnixSeconds: order.src?.timelock,
-    amountWei: order.src?.amount,
-    refundTxHash: order.status === 'refunded' ? order.secret?.revealedTx : undefined,
-    refundNetwork: isEthToXlm ? 'ethereum' : 'stellar',
-    refundedAt: order.status === 'refunded' ? order.updatedAt * 1000 : undefined,
-    networkMode: isTestnetMode ? 'testnet' : 'mainnet'
-  };
-}
 
 export default function TransactionHistory({ ethAddress, stellarAddress }: TransactionHistoryProps) {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
@@ -207,7 +102,6 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
       return [];
     }
   }, []);
-
   /**
    * Fetch one page of coordinator history.
    *
@@ -220,6 +114,12 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
       commitTransactions(loadFromStorage());
       setNextCursor(null);
       setHistoryError(null);
+
+  const refreshFromCoordinator = useCallback(async () => {
+    const local = loadFromStorage();
+    if (!ethAddress && !stellarAddress) {
+      setTransactions(local);
+
       return;
     }
 
@@ -270,6 +170,15 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
       // user can tell the difference between "no more orders" and "we lost the
       // cursor". Only a failed first page falls back to the local cache.
       if (cursor === null) commitTransactions(loadFromStorage());
+
+      const remote = await fetchCoordinatorOrders(API_BASE_URL, { ethAddress, stellarAddress });
+      const merged = mergeTransactions(local, remote);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+      setTransactions(merged);
+    } catch (err) {
+      console.warn('Coordinator history unavailable, falling back to local cache:', err);
+      setTransactions(local);
+
     } finally {
       setIsLoading(false);
     }
@@ -559,30 +468,44 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
 
                 <div className="flex flex-wrap items-center gap-1.5">
                   {tx.ethTxHash && isRealHash(tx.ethTxHash) && (
-                    <a
-                      href={getEtherscanUrl(tx.ethTxHash)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.045] px-2.5 py-1 text-[11px] font-semibold text-slate-300 transition hover:bg-white/[0.08] hover:text-white"
-                      title="View on Etherscan"
-                    >
-                      <img src="/images/eth.png" alt="ETH" className="h-3.5 w-3.5" />
-                      <span>Etherscan</span>
-                      <ExternalLink className="h-3 w-3 opacity-70" />
-                    </a>
+                    <div className="flex items-center gap-1">
+                      <a
+                        href={getEtherscanUrl(tx.ethTxHash)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.045] px-2.5 py-1 text-[11px] font-semibold text-slate-300 transition hover:bg-white/[0.08] hover:text-white"
+                        title="View on Etherscan"
+                      >
+                        <img src="/images/eth.png" alt="ETH" className="h-3.5 w-3.5" />
+                        <span>Etherscan</span>
+                        <ExternalLink className="h-3 w-3 opacity-70" />
+                      </a>
+                      <CopyableIdentifier
+                        value={getEtherscanUrl(tx.ethTxHash)}
+                        hideDisplay
+                        copyLabel="Etherscan URL"
+                      />
+                    </div>
                   )}
                   {tx.stellarTxHash && isRealHash(tx.stellarTxHash) && (
-                    <a
-                      href={getStellarExplorerUrl(tx.stellarTxHash)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.045] px-2.5 py-1 text-[11px] font-semibold text-slate-300 transition hover:bg-white/[0.08] hover:text-white"
-                      title="View on Stellar Expert"
-                    >
-                      <img src="/images/xlm.png" alt="XLM" className="h-3.5 w-3.5" />
-                      <span>Stellar Expert</span>
-                      <ExternalLink className="h-3 w-3 opacity-70" />
-                    </a>
+                    <div className="flex items-center gap-1">
+                      <a
+                        href={getStellarExplorerUrl(tx.stellarTxHash)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.045] px-2.5 py-1 text-[11px] font-semibold text-slate-300 transition hover:bg-white/[0.08] hover:text-white"
+                        title="View on Stellar Expert"
+                      >
+                        <img src="/images/xlm.png" alt="XLM" className="h-3.5 w-3.5" />
+                        <span>Stellar Expert</span>
+                        <ExternalLink className="h-3.5 w-3.5 opacity-70" />
+                      </a>
+                      <CopyableIdentifier
+                        value={getStellarExplorerUrl(tx.stellarTxHash)}
+                        hideDisplay
+                        copyLabel="Stellar Expert URL"
+                      />
+                    </div>
                   )}
                 </div>
               </div>
@@ -646,22 +569,29 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                     </button>
                   )}
                   {tx.refundTxHash && (
-                    <a
-                      href={getRefundExplorerUrl(tx)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/25"
-                      title={`Refund settled on ${getRefundNetworkLabel(tx)}. Click to view the refund transaction.`}
-                    >
-                      <Undo2 className="h-3.5 w-3.5" />
-                      <span>Refunded · view on</span>
-                      <img
-                        src={getRefundNetwork(tx) === 'ethereum' ? '/images/eth.png' : '/images/xlm.png'}
-                        alt={getRefundNetworkLabel(tx)}
-                        className="h-3.5 w-3.5"
+                    <div className="flex items-center gap-1">
+                      <a
+                        href={getRefundExplorerUrl(tx)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-500/15 px-3 py-1.5 text-xs font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/25"
+                        title={`Refund settled on ${getRefundNetworkLabel(tx)}. Click to view the refund transaction.`}
+                      >
+                        <Undo2 className="h-3.5 w-3.5" />
+                        <span>Refunded · view on</span>
+                        <img
+                          src={getRefundNetwork(tx) === 'ethereum' ? '/images/eth.png' : '/images/xlm.png'}
+                          alt={getRefundNetworkLabel(tx)}
+                          className="h-3.5 w-3.5"
+                        />
+                        <span>{getRefundNetworkLabel(tx)}</span>
+                      </a>
+                      <CopyableIdentifier
+                        value={getRefundExplorerUrl(tx)}
+                        hideDisplay
+                        copyLabel="refund URL"
                       />
-                      <span>{getRefundNetworkLabel(tx)}</span>
-                    </a>
+                    </div>
                   )}
                   {canRefund(tx) && (
                     <button
