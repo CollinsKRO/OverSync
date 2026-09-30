@@ -201,13 +201,13 @@ describe("runPreflightChecks", () => {
 
     const results = await runPreflightChecks();
 
-    const evmNetCheck = results.find(r => r.name === "Ethereum network matches expected testnet configuration");
+    const evmNetCheck = results.find(r => r.name === "Ethereum network matches expected network configuration");
     expect(evmNetCheck?.status).toBe("SKIPPED");
-    expect(evmNetCheck?.guidance).toContain("EVM RPC reachability");
+    expect(evmNetCheck?.guidance).toContain("Skipped due to network agreement failure");
 
-    const stellarNetCheck = results.find(r => r.name === "Stellar network matches expected testnet configuration");
+    const stellarNetCheck = results.find(r => r.name === "Stellar network matches expected network configuration");
     expect(stellarNetCheck?.status).toBe("SKIPPED");
-    expect(stellarNetCheck?.guidance).toContain("Stellar RPC reachability");
+    expect(stellarNetCheck?.guidance).toContain("Skipped due to network agreement failure");
 
     // Threshold checks should skip since RPCs are unavailable
     const evmThresholdCheck = results.find(r => r.name === "Ethereum stake threshold can be read");

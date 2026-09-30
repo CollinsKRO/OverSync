@@ -10,6 +10,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { sepolia, mainnet } from "viem/chains";
 import { loadConfig } from "../config.js";
 import { getLogger } from "../logger.js";
+import { checkResolverNetworkAgreement } from "../network-agreement.js";
 
 const REGISTRY_ABI = parseAbi([
   "function register(uint256 stake)",
@@ -48,8 +49,21 @@ function ensureEvmContext() {
 }
 
 export async function registerCommand(amountInput?: string): Promise<void> {
-  const { cfg, log, account, publicClient, walletClient } = ensureEvmContext();
-  const registry = cfg.ethereum.resolverRegistry as Address;
+  const cfg = loadConfig();
+  
+  // Check network agreement before any transaction
+  const agreement = await checkResolverNetworkAgreement(
+    cfg.network,
+    cfg.ethereum.rpcUrl,
+    cfg.soroban.rpcUrl,
+    cfg.soroban.networkPassphrase
+  );
+  if (agreement.status === "fail") {
+    throw new Error(`Network agreement failed: ${agreement.detail}. Observed: EVM=${agreement.observed.evm.rpcUrl} (chainId=${agreement.observed.evm.chainId}), Soroban=${agreement.observed.soroban.rpcUrl} (passphrase=${agreement.observed.soroban.networkPassphrase})`);
+  }
+
+  const { cfg: config, log, account, publicClient, walletClient } = ensureEvmContext();
+  const registry = config.ethereum.resolverRegistry as Address;
 
   const stakeAsset = (await publicClient.readContract({
     address: registry,

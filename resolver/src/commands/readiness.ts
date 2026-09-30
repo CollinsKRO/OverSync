@@ -21,7 +21,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { sepolia, mainnet } from "viem/chains";
 import { rpc, Keypair } from "@stellar/stellar-sdk";
 import { resolveEthereumRpcUrl } from "../ethereum-rpc-url.js";
-import { checkCoordinatorNetwork, redactUrl } from "../network-agreement.js";
+import { checkCoordinatorNetwork, checkResolverNetworkAgreement, redactUrl } from "../network-agreement.js";
 
 // Load .env from CWD. dotenv is a no-op if the file is missing, so this is
 // safe for tests and prod. Existing env vars take precedence over .env.
@@ -222,6 +222,28 @@ export async function assessReadiness(): Promise<ReadinessResult> {
     label: "Stellar / Soroban RPC reachable",
     status: sorobanPing.ok ? "ok" : "fail",
     detail: sorobanPing.detail
+  });
+
+  // ===== Resolver network agreement (EVM + Soroban match NETWORK_MODE) =====
+  const evmRpcUrl = resolveEthereumRpcUrl(network);
+  const sorobanRpcUrl =
+    process.env.SOROBAN_RPC_URL?.trim() ||
+    (network === "mainnet" ? "https://mainnet.sorobanrpc.com" : "https://soroban-testnet.stellar.org");
+  const sorobanNetworkPassphrase = network === "mainnet"
+    ? "Public Global Stellar Network ; September 2015"
+    : "Test SDF Network ; September 2015";
+
+  const resolverAgreement = await checkResolverNetworkAgreement(
+    network,
+    evmRpcUrl,
+    sorobanRpcUrl,
+    sorobanNetworkPassphrase
+  );
+  checks.push({
+    id: "resolver-network-agreement",
+    label: "Resolver EVM and Soroban networks agree with NETWORK_MODE",
+    status: resolverAgreement.status === "ok" ? "ok" : "fail",
+    detail: resolverAgreement.detail
   });
 
   const sorobanRegistry = process.env[sorobanRegistryEnv];
