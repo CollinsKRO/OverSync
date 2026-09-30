@@ -19,6 +19,16 @@ import {
   type TimelockValidationError
 } from "../utils/timelock-validator.js";
 
+/**
+ * Minimal interface the coordinator uses to verify that an Ethereum
+ * address is currently registered in the on-chain ResolverRegistry.
+ * Kept as a port so the service layer stays free of ethers / viem.
+ */
+export interface ResolverRegistryPort {
+  /** Returns true if `address` is currently active in the registry. */
+  isActive(address: string): Promise<boolean>;
+}
+
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_HASHLOCK = "0x" + "0".repeat(64);
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -113,7 +123,9 @@ export class OrderService {
     private readonly log: Logger,
     /** Optional — when supplied, quoteId in announce requests is validated. */
     private readonly quoteService?: QuoteService,
-    config?: ReturnType<typeof loadConfig>
+    config?: ReturnType<typeof loadConfig>,
+    /** Optional — when supplied, buildClaim validates resolver registration. */
+    private readonly resolverRegistry?: ResolverRegistryPort
   ) {
     this.minGapSeconds = config?.timelockSafetyGapSeconds ?? 600;
   }
@@ -294,5 +306,40 @@ export class OrderService {
 
   async getSnapshots(): Promise<OrderSnapshot[]> {
     return this.repo.getCompletedOrderSnapshots();
+  }
+
+  /**
+   * Validate that the coordinator may build a claim transaction for
+   * `orderId` on behalf of `resolverAddress`.
+   *
+   * Throws `OrderValidationError` when:
+   *  - The order does not exist or is not in a claimable state.
+   *  - The resolver registry is configured and the resolver address is
+   *    not currently active (never registered, or removed).
+   *
+   * Returns the order row so the caller can assemble the transaction
+   * without a second DB round-trip.
+   */
+  async buildClaim(orderId: string, resolverAddress: string): Promise<OrderRow> {
+    const order = await this.repo.findByPublicId(orderId);
+    if (!order) throw new OrderValidationError(`unknown order ${orderId}`);
+
+    if (order.status !== "dst_locked") {
+      throw new OrderValidationError(
+        `order ${orderId} is not in dst_locked state (current: ${order.status})`
+      );
+    }
+
+    if (this.resolverRegistry) {
+      const active = await this.resolverRegistry.isActive(resolverAddress);
+      if (!active) {
+        throw new OrderValidationError(
+          `resolver ${resolverAddress} is not registered or has been removed from the registry`
+        );
+      }
+      this.log.debug({ orderId, resolverAddress }, "resolver registry check passed");
+    }
+
+    return order;
   }
 }
