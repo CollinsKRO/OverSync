@@ -1,5 +1,6 @@
 import { ExternalLink, BarChart3 } from 'lucide-react';
 import { testnetTraction, type TractionMetric } from '../config/testnet-traction';
+import { isTestnet } from '../config/networks';
 
 function TractionRow({ metric }: { metric: TractionMetric }) {
   const content = (
@@ -23,6 +24,14 @@ function TractionRow({ metric }: { metric: TractionMetric }) {
 }
 
 export default function TestnetTractionCard() {
+  // Only render when the app is running in testnet mode AND the fixture is
+  // tagged for testnet. A mismatch (e.g. mainnet mode, unknown network, or a
+  // fixture tagged for a different network) hides the card entirely so testnet
+  // counts can never appear on a mainnet screen.
+  if (testnetTraction.network !== 'testnet' || !isTestnet()) {
+    return null;
+  }
+
   const { deployedContracts, supportedRoutes, testsByLayer, resolverCount, publicFrontendStatus, lastUpdated, sourceLinks } = testnetTraction;
 
   return (

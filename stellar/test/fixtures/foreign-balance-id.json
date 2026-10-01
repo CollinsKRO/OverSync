@@ -1,0 +1,9 @@
+{
+  "id": "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "amount": "10.0000000",
+  "asset": { "asset_type": "credit_alphanum4", "asset_code": "USDC", "asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" },
+  "sponsor": "GABCDEFGHIJKL1234567890ABCDEFGHIJKL1234567890",
+  "claimants": [
+    { "destination": "GAM5UF5YSDBDIMJFIFWL5L5JRSTD3RDOMST2OHARXSCXTN6LR46ZISZ6" }
+  ]
+}

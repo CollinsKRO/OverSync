@@ -231,10 +231,52 @@ const FIXTURES: FixtureDef[] = [
   }
 ];
 
+/**
+ * The passphrases that make demo-fixture data unsafe (#279).
+ *
+ * Demo fixtures ship fake orders that look real. On a mainnet coordinator
+ * they could be relayed as if a user had created them, so every fixture
+ * path keys off the network before touching the database.
+ */
+export const MAINNET_STELLAR_PASSPHRASE =
+  "Public Global Stellar Network ; September 2015";
+
+export class DemoFixturesMainnetError extends Error {
+  constructor() {
+    super(
+      "Refusing to load demo fixtures: the coordinator is configured for mainnet"
+    );
+    this.name = "DemoFixturesMainnetError";
+  }
+}
+
+/**
+ * Whether demo fixtures are allowed under this configuration (#279).
+ *
+ * Checks the Stellar network passphrase (the same value `config.ts` derives
+ * from NETWORK_MODE) so the loader cannot be tricked by a mainnet setup
+ * that only overrode `COORDINATOR_DEMO_FIXTURES`.
+ */
+export function fixturesAllowedForNetwork(
+  networkPassphrase: string
+): boolean {
+  return networkPassphrase !== MAINNET_STELLAR_PASSPHRASE;
+}
+
 export async function seedDemoFixtures(
   repo: OrdersRepository,
-  log: Logger
+  log: Logger,
+  networkPassphrase: string
 ): Promise<void> {
+  // Network check FIRST — before any read or insert (#279).
+  if (!fixturesAllowedForNetwork(networkPassphrase)) {
+    log.warn(
+      { network: "mainnet" },
+      "Demo fixtures refused: coordinator is on mainnet"
+    );
+    throw new DemoFixturesMainnetError();
+  }
+
   const existing = await repo.countFixtures();
   if (existing > 0) {
     log.info({ count: existing }, "Demo fixtures already seeded, skipping");
@@ -253,6 +295,8 @@ export async function seedDemoFixtures(
         t.from === null ? "fixture_seeded" : t.to
       );
     }
+    // Debug level only, and never the preimage or hashlock preimages —
+    // fixture payloads must not leak into logs (#279).
     log.debug({ publicId: def.publicId, status: def.status }, "demo fixture seeded");
   }
 

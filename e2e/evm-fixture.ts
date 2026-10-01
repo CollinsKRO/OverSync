@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import { ethers } from "ethers";
+import { ethers, type ErrorFragment, type InterfaceAbi } from "ethers";
 
 export type Hex = `0x${string}`;
 
@@ -31,6 +31,8 @@ const artifactPath = join(
 
 const AMOUNT = ethers.parseEther("0.5");
 const SAFETY_DEPOSIT = 0n;
+/** The escrow value locked per order, exported so tests can assert balances. */
+export const ESCROW_AMOUNT = AMOUNT;
 const ZERO_ADDR = ethers.ZeroAddress;
 const HARDHAT_RPC = "http://127.0.0.1:8545";
 const DEPLOYER_KEY =
@@ -41,25 +43,39 @@ const BENEFICIARY_KEY =
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface RealEvmHtlcFixture {
+  nextOrderId(): Promise<bigint>;
   createOrder(hashlock: Hex, timelockSeconds: number): Promise<bigint>;
   claimOrder(orderId: bigint, preimage: Hex): Promise<void>;
   claimOrderExpectRevert(orderId: bigint, preimage: Hex): Promise<string>;
   getOrderStatus(orderId: bigint): Promise<"Funded" | "Claimed" | "Refunded">;
+  /** Total ETH currently held in escrow by the deployed contract. */
+  getEscrowBalance(): Promise<bigint>;
   stop(): Promise<void>;
 }
+
+/**
+ * The canonical Hardhat/Anvil dev accounts used by this fixture. These are
+ * publicly documented test keys with no real funds — the suite never uses a
+ * mainnet key. Exported so tests can assert that invariant.
+ */
+export const HARDHAT_TEST_KEYS = {
+  deployer: DEPLOYER_KEY,
+  beneficiary: BENEFICIARY_KEY
+} as const;
 
 const STATUS_MAP = ["Funded", "Claimed", "Refunded"] as const;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function decodeCustomError(abi: unknown[], data: string | undefined): string | null {
+function decodeCustomError(abi: InterfaceAbi, data: string | undefined): string | null {
   if (!data || data.length < 10) return null;
   const selector = data.slice(0, 10).toLowerCase();
   const iface = new ethers.Interface(abi);
   for (const fragment of iface.fragments) {
     if (fragment.type === "error") {
-      const computed = iface.getError(fragment.name)?.selector;
-      if (computed?.toLowerCase() === selector) return fragment.name;
+      const errorFragment = fragment as ErrorFragment;
+      const computed = iface.getError(errorFragment.name)?.selector;
+      if (computed?.toLowerCase() === selector) return errorFragment.name;
     }
   }
   return null;
@@ -73,6 +89,7 @@ async function spawnHardhatNode(): Promise<ChildProcess> {
     cwd: contractsDir,
     stdio: ["ignore", "pipe", "pipe"],
     shell: true,
+    detached: process.platform !== "win32",
   });
 
   // Wait until the node prints its ready message
@@ -139,6 +156,10 @@ export async function startEvmFixture(): Promise<RealEvmHtlcFixture> {
   const escrowAsBeneficiary = new ethers.Contract(contractAddress, HTLC_ABI, beneficiary);
 
   return {
+    async nextOrderId(): Promise<bigint> {
+      return await escrow.nextOrderId();
+    },
+
     async createOrder(hashlock: Hex, timelockSeconds: number): Promise<bigint> {
       const total = AMOUNT + SAFETY_DEPOSIT;
       deployer.reset();
@@ -192,11 +213,21 @@ export async function startEvmFixture(): Promise<RealEvmHtlcFixture> {
       return STATUS_MAP[Number(order.status)];
     },
 
+    async getEscrowBalance(): Promise<bigint> {
+      return await provider.getBalance(contractAddress);
+    },
+
     async stop(): Promise<void> {
       await provider.destroy();
-      nodeProcess.kill();
-      // Give the process a moment to clean up the port
-      await new Promise((r) => setTimeout(r, 500));
+      if (nodeProcess.exitCode === null && nodeProcess.signalCode === null) {
+        const exited = new Promise<void>((resolve) => nodeProcess.once("exit", () => resolve()));
+        if (process.platform === "win32") {
+          nodeProcess.kill();
+        } else if (nodeProcess.pid) {
+          process.kill(-nodeProcess.pid, "SIGTERM");
+        }
+        await exited;
+      }
     },
   };
 }

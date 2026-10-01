@@ -53,11 +53,25 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
       setTimeout: vi.fn().mockReturnThis(),
       build: vi.fn().mockReturnValue({})
     })),
-    nativeToScVal: vi.fn().mockReturnValue({})
+    nativeToScVal: vi.fn().mockReturnValue({}),
+    scValToNative: (value: unknown) => value
   };
 });
 
-import { checkPreflight, buildJsonOutput } from "../src/commands/check.js";
+const mockEthereumStart = vi.fn().mockResolvedValue(undefined);
+const mockSorobanStart = vi.fn().mockResolvedValue(undefined);
+vi.mock("../src/listeners/ethereum.js", () => ({
+  EthereumListener: class { start = mockEthereumStart; }
+}));
+vi.mock("../src/listeners/soroban.js", () => ({
+  SorobanListener: class { start = mockSorobanStart; }
+}));
+vi.mock("../src/network-agreement.js", () => ({
+  checkCoordinatorNetwork: vi.fn().mockResolvedValue({ status: "ok" })
+}));
+
+import { checkPreflight, buildJsonOutput, checkCommand } from "../src/commands/check.js";
+import { runCommand } from "../src/commands/run.js";
 import { __setMockConfig } from "../src/config.js";
 import type { ResolverConfig } from "../src/config.js";
 
@@ -167,6 +181,98 @@ describe("checkPreflight", () => {
     const results = await checkPreflight();
     expect(results[0].active).toBe("unknown");
     expect(results[1].active).toBe("unknown");
+  });
+});
+
+describe("deployment address check", () => {
+  const ethereumEscrow = "0x1111111111111111111111111111111111111111";
+  const ethereumRegistry = "0x2222222222222222222222222222222222222222";
+  const sorobanRegistry = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBB5";
+  const config: ResolverConfig = {
+    network: "testnet",
+    pollIntervalMs: 15000,
+    coordinatorUrl: "http://localhost:3001",
+    logLevel: "info",
+    ethereum: {
+      rpcUrl: "http://localhost:8545",
+      chainId: 11155111,
+      htlcEscrow: ethereumEscrow,
+      resolverRegistry: ethereumRegistry,
+      resolverPrivateKey: "0xsecret"
+    },
+    soroban: {
+      rpcUrl: "http://localhost:8000",
+      networkPassphrase: "Test SDF Network ; September 2015",
+      horizonUrl: "http://localhost:8001",
+      htlc: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBB4",
+      resolverRegistry: sorobanRegistry,
+      resolverSecret: "Ssecret"
+    }
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __setMockConfig(config);
+    mockReadContract.mockImplementation(({ functionName }) =>
+      functionName === "resolverRegistry" ? ethereumRegistry : true
+    );
+    mockSimulateTransaction.mockResolvedValue({ result: { retval: sorobanRegistry } });
+  });
+
+  it("passes check and starts both listeners when both chain pointers match", async () => {
+    mockSimulateTransaction
+      .mockResolvedValueOnce({ result: { retval: sorobanRegistry } })
+      .mockResolvedValueOnce({ result: { retval: { switch: () => ({ name: "scvBool" }), b: () => true } } })
+      .mockResolvedValueOnce({ result: { retval: sorobanRegistry } })
+      .mockResolvedValueOnce({ result: { retval: { switch: () => ({ name: "scvBool" }), b: () => true } } });
+
+    await expect(checkCommand()).resolves.toBeUndefined();
+    const on = vi.spyOn(process, "on").mockImplementation(() => process);
+    try {
+      await expect(runCommand()).resolves.toBeUndefined();
+    } finally {
+      on.mockRestore();
+    }
+    expect(mockEthereumStart).toHaveBeenCalledOnce();
+    expect(mockSorobanStart).toHaveBeenCalledOnce();
+    expect(mockReadContract).toHaveBeenCalledWith(expect.objectContaining({
+      address: ethereumEscrow,
+      functionName: "resolverRegistry"
+    }));
+  });
+
+  it.each([
+    ["Ethereum", "0x3333333333333333333333333333333333333333", sorobanRegistry, "ETH_RESOLVER_REGISTRY"],
+    ["Soroban", ethereumRegistry, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBB6", "SOROBAN_RESOLVER_REGISTRY"]
+  ])("rejects %s mismatch before listeners start", async (_chain, evmOnChain, sorobanOnChain, field) => {
+    mockReadContract.mockResolvedValue(evmOnChain);
+    mockSimulateTransaction.mockResolvedValue({ result: { retval: sorobanOnChain } });
+
+    await expect(checkCommand()).rejects.toThrow(field);
+    await expect(runCommand()).rejects.toThrow(field);
+    expect(mockEthereumStart).not.toHaveBeenCalled();
+    expect(mockSorobanStart).not.toHaveBeenCalled();
+    expect(mockReadContract).toHaveBeenCalledWith(expect.objectContaining({
+      address: ethereumEscrow,
+      functionName: "resolverRegistry"
+    }));
+    expect(mockReadContract).toHaveBeenCalledTimes(2);
+    expect(mockSimulateTransaction).toHaveBeenCalledTimes(2);
+    try {
+      await checkCommand();
+    } catch (error) {
+      expect(String(error)).not.toContain("0xsecret");
+      expect(String(error)).not.toContain("Ssecret");
+    }
+  });
+
+  it("fails closed on an unreadable escrow without exposing RPC error details", async () => {
+    mockReadContract.mockRejectedValue(new Error("RPC URL contained 0xsecret"));
+    await expect(checkCommand()).rejects.toThrow("Could not read ETH_HTLC_ESCROW resolverRegistry");
+    await expect(runCommand()).rejects.toThrow("Could not read ETH_HTLC_ESCROW resolverRegistry");
+    expect(mockSimulateTransaction).not.toHaveBeenCalled();
+    expect(mockEthereumStart).not.toHaveBeenCalled();
+    expect(mockSorobanStart).not.toHaveBeenCalled();
   });
 });
 

@@ -22,10 +22,7 @@ interface IHTLCEscrow {
         address token;          // address(0) == native ETH
         uint256 amount;
         uint256 safetyDeposit;
-        bytes32 hashlock;       // sha256(preimage) when interoperating
-                                // with the Soroban side; the contract
-                                // verifies both sha256 AND keccak256 so
-                                // resolver implementations can choose.
+        bytes32 hashlock;       // sha256(uint256 orderId, big-endian || preimage)
         uint64  timelock;       // unix seconds; refund allowed after.
         uint64  createdAt;
         uint64  finalisedAt;    // 0 while Funded

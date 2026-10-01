@@ -14,6 +14,8 @@ import {
   createMainnetConfig,
   generatePreimageAndHash,
   verifyPreimage,
+  buildEscrowTerms,
+  EscrowTerms,
 } from './claimable-balance.js';
 import { resolveStellarAsset } from '@oversync/sdk';
 
@@ -108,11 +110,13 @@ export default class StellarClient {
    * Claim Stellar claimable balance with preimage
    * @param balanceId Claimable balance ID
    * @param preimage Secret preimage
+   * @param order Order whose escrow the balance must match before any claim tx is built
    * @returns Bridge transaction result
    */
   async claimStellarHTLC(
     balanceId: string,
-    preimage: string
+    preimage: string,
+    order: CrossChainOrder
   ): Promise<StellarBridgeResult> {
     try {
       console.log(`🔑 Claiming Stellar HTLC: ${balanceId}`);
@@ -121,6 +125,7 @@ export default class StellarClient {
         claimerSecretKey: this.relayerSecretKey,
         balanceId,
         preimage,
+        expected: this.expectedEscrowTerms(order),
       };
 
       const txHash = await this.htlcManager.claimWithPreimage(claimParams);
@@ -143,10 +148,12 @@ export default class StellarClient {
   /**
    * Refund expired Stellar claimable balance
    * @param balanceId Claimable balance ID
+   * @param order Order whose escrow the balance must match before any refund tx is built
    * @returns Bridge transaction result
    */
   async refundStellarHTLC(
-    balanceId: string
+    balanceId: string,
+    order: CrossChainOrder
   ): Promise<StellarBridgeResult> {
     try {
       console.log(`🔄 Refunding expired Stellar HTLC: ${balanceId}`);
@@ -154,6 +161,7 @@ export default class StellarClient {
       const refundParams: RefundParams = {
         refunderSecretKey: this.relayerSecretKey,
         balanceId,
+        expected: this.expectedEscrowTerms(order),
       };
 
       const txHash = await this.htlcManager.refundExpired(refundParams);
@@ -231,6 +239,24 @@ export default class StellarClient {
   // PRIVATE HELPER METHODS  
   // ═══════════════════════════════════════════════════════════════════════════════════════
 
+  /**
+   * Escrow terms a balance must match before it may be claimed or refunded.
+   * Derived from the order only — never from the balance id handed to us.
+   * The claimant is the order's Stellar beneficiary, the account the balance is
+   * created for in {@link createHTLCFromEthereumOrder}.
+   */
+  private expectedEscrowTerms(order: CrossChainOrder): EscrowTerms {
+    const network = this.isTestnet ? 'testnet' : 'mainnet';
+    const stellarAsset = resolveStellarAsset(order.token, network);
+    return buildEscrowTerms({
+      assetCode: stellarAsset.code,
+      assetIssuer: stellarAsset.issuer,
+      amount: order.amount,
+      claimant: order.recipient,
+      network,
+    });
+  }
+
 }
 
 // Export utilities for external use
@@ -240,4 +266,6 @@ export {
   createMainnetConfig,
   generatePreimageAndHash,
   verifyPreimage,
-}; 
+};
+
+export type { EscrowTerms, BalanceMismatchError, RecordedBalanceJson, BalanceLoader } from './claimable-balance-match.js'; 

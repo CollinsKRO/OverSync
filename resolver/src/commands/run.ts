@@ -2,7 +2,7 @@ import { loadConfig } from "../config.js";
 import { getLogger } from "../logger.js";
 import { EthereumListener } from "../listeners/ethereum.js";
 import { SorobanListener } from "../listeners/soroban.js";
-import { checkPreflight } from "./check.js";
+import { checkDeploymentAddresses, checkPreflight } from "./check.js";
 import { buildPlan } from "../planner/index.js";
 import { observedFromEthereumEvent } from "../planner/index.js";
 import { checkCoordinatorNetwork, checkResolverNetworkAgreement } from "../network-agreement.js";

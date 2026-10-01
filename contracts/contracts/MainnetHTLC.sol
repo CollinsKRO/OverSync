@@ -3,14 +3,14 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import {IResolverRegistry} from "./v2/interfaces/IResolverRegistry.sol";
 
 /**
  * @title MainnetHTLC - Mainnet Optimized Cross-Chain Bridge
  * @dev Simplified HTLC implementation optimized for mainnet deployment
  * @notice Secure cross-chain token swaps between Ethereum and Stellar
  */
-contract MainnetHTLC is ReentrancyGuard, Ownable {
+contract MainnetHTLC is ReentrancyGuard {
     
     // ═══════════════════════════════════════════════════════════════════════════════════════
     // STRUCTS & ENUMS
@@ -28,7 +28,7 @@ contract MainnetHTLC is ReentrancyGuard, Ownable {
         uint256 amount;           // Amount locked
         bytes32 hashLock;         // Hash of the secret
         uint256 timelock;         // Expiration timestamp
-        address beneficiary;      // Who can claim
+        address beneficiary;      // Receives the claimed amount
         address refundAddress;    // Who gets refund
         OrderStatus status;       // Current status
         uint256 createdAt;        // Creation timestamp
@@ -42,8 +42,10 @@ contract MainnetHTLC is ReentrancyGuard, Ownable {
     mapping(address => bytes32[]) public userOrders;
     
     uint256 public nextOrderId = 1;
-    uint256 public minTimelock = 1 hours;
-    uint256 public maxTimelock = 7 days;
+    uint256 public constant minTimelock = 5 minutes;
+    uint256 public constant maxTimelock = 1 days;
+    // Like v2, the optional registry gates creation only; settlement is permissionless.
+    IResolverRegistry public immutable resolverRegistry;
     
     // ═══════════════════════════════════════════════════════════════════════════════════════
     // EVENTS
@@ -74,8 +76,8 @@ contract MainnetHTLC is ReentrancyGuard, Ownable {
     // CONSTRUCTOR
     // ═══════════════════════════════════════════════════════════════════════════════════════
     
-    constructor() Ownable(msg.sender) {
-        // Simple constructor for mainnet deployment
+    constructor(IResolverRegistry _resolverRegistry) {
+        resolverRegistry = _resolverRegistry;
     }
     
     // ═══════════════════════════════════════════════════════════════════════════════════════
@@ -88,7 +90,7 @@ contract MainnetHTLC is ReentrancyGuard, Ownable {
      * @param amount Amount to lock
      * @param hashLock Hash of the secret
      * @param timelock Expiration timestamp
-     * @param beneficiary Address that can claim the order
+     * @param beneficiary Address that receives the claimed amount
      * @param refundAddress Address that receives refund after timeout
      */
     function createOrder(
@@ -101,10 +103,13 @@ contract MainnetHTLC is ReentrancyGuard, Ownable {
     ) external payable nonReentrant returns (bytes32 orderId) {
         require(amount > 0, "Amount must be > 0");
         require(hashLock != bytes32(0), "Invalid hash lock");
-        require(timelock > block.timestamp + minTimelock, "Timelock too early");
-        require(timelock < block.timestamp + maxTimelock, "Timelock too late");
+        require(timelock >= block.timestamp + minTimelock, "Timelock too early");
+        require(timelock <= block.timestamp + maxTimelock, "Timelock too late");
         require(beneficiary != address(0), "Invalid beneficiary");
         require(refundAddress != address(0), "Invalid refund address");
+        if (address(resolverRegistry) != address(0)) {
+            require(resolverRegistry.isActive(msg.sender), "Resolver not authorised");
+        }
         
         // Generate order ID
         orderId = keccak256(abi.encodePacked(msg.sender, nextOrderId, block.timestamp));
@@ -145,13 +150,28 @@ contract MainnetHTLC is ReentrancyGuard, Ownable {
      * @param secret Secret that matches the hash lock
      */
     function claimOrder(bytes32 orderId, bytes32 secret) external nonReentrant {
+        _claimOrder(orderId, abi.encodePacked(secret), secret);
+    }
+
+    /// @notice Claim with a variable-length preimage, as supported by v2.
+    function claimOrder(bytes32 orderId, bytes calldata preimage) external nonReentrant {
+        bytes32 eventSecret;
+        if (preimage.length > 0) {
+            assembly {
+                eventSecret := calldataload(preimage.offset)
+            }
+        }
+        _claimOrder(orderId, preimage, eventSecret);
+    }
+
+    function _claimOrder(bytes32 orderId, bytes memory preimage, bytes32 eventSecret) private {
         Order storage order = orders[orderId];
         
         require(order.sender != address(0), "Order not found");
         require(order.status == OrderStatus.Created, "Order not claimable");
-        require(block.timestamp < order.timelock, "Order expired");
-        require(keccak256(abi.encodePacked(secret)) == order.hashLock, "Invalid secret");
-        require(msg.sender == order.beneficiary, "Not beneficiary");
+        require(block.timestamp <= order.timelock, "Order expired");
+        require(sha256(preimage) == order.hashLock ||
+                keccak256(preimage) == order.hashLock, "Invalid secret");
         
         // Update order status
         order.status = OrderStatus.Claimed;
@@ -165,7 +185,7 @@ contract MainnetHTLC is ReentrancyGuard, Ownable {
             IERC20(order.token).transfer(order.beneficiary, order.amount);
         }
         
-        emit OrderClaimed(orderId, msg.sender, secret);
+        emit OrderClaimed(orderId, msg.sender, eventSecret);
     }
     
     /**
@@ -177,7 +197,7 @@ contract MainnetHTLC is ReentrancyGuard, Ownable {
         
         require(order.sender != address(0), "Order not found");
         require(order.status == OrderStatus.Created, "Order not refundable");
-        require(block.timestamp >= order.timelock, "Order not expired");
+        require(block.timestamp > order.timelock, "Order not expired");
         
         // Update order status
         order.status = OrderStatus.Refunded;
@@ -219,31 +239,7 @@ contract MainnetHTLC is ReentrancyGuard, Ownable {
         Order memory order = orders[orderId];
         return order.sender != address(0) && 
                order.status == OrderStatus.Created && 
-               block.timestamp < order.timelock;
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════════════════════════
-    // ADMIN FUNCTIONS
-    // ═══════════════════════════════════════════════════════════════════════════════════════
-    
-    /**
-     * @dev Update timelock limits (only owner)
-     */
-    function updateTimelockLimits(uint256 _minTimelock, uint256 _maxTimelock) external onlyOwner {
-        require(_minTimelock < _maxTimelock, "Invalid timelock limits");
-        minTimelock = _minTimelock;
-        maxTimelock = _maxTimelock;
-    }
-    
-    /**
-     * @dev Emergency withdrawal (only owner)
-     */
-    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
-        if (token == address(0)) {
-            payable(owner()).transfer(amount);
-        } else {
-            IERC20(token).transfer(owner(), amount);
-        }
+               block.timestamp <= order.timelock;
     }
     
     /**

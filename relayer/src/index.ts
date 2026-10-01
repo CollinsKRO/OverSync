@@ -11,7 +11,7 @@ import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { ethers } from 'ethers';
-import { startRefundWatchdog } from './refund-watchdog.js';
+import { startRefundWatchdog, type RefundWatchdogHandle } from './refund-watchdog.js';
 import { startContractEventPoller, type ContractEventBinding, type ContractEventPollerHandle } from './contract-event-poller.js';
 import { startAdaptivePoll, type AdaptivePollHandle } from './adaptive-poll.js';
 import { validateTimelockOrdering } from "./utils/timelock-validator.js";
@@ -167,7 +167,7 @@ function getEscrowFactoryABI(isMainnet: boolean) {
   return isMainnet ? MAINNET_ESCROW_FACTORY_ABI : TESTNET_ESCROW_FACTORY_ABI;
 }
 import { ethereumListener } from './ethereum-listener.js';
-import { quoterService } from './quoter-service.js';
+import { quoterService, type QuoteResponse } from './quoter-service.js';
 import { ordersService } from './orders.js';
 import { gasPriceTracker } from './gas-tracker.js';
 import { presetManager } from './preset-manager.js';
@@ -183,13 +183,28 @@ import ClientSubscriptionManager from './client-subscriptions.js';
 
 
 // Phase 5: Recovery System imports
-import RecoveryService, { RecoveryConfig, RecoveryType, RecoveryStatus } from './recovery-service.js';
+import RecoveryService, {
+  RecoveryConfig,
+  RecoveryType,
+  RecoveryStatus,
+  type RecoverySubmitter,
+} from './recovery-service.js';
 
 // Stellar SDK will be imported dynamically when needed
 
 // Phase 8: Monitoring System imports
 import { getMonitor } from './monitoring.js';
-import { RelaySubmissionTracker, RelayInFlightError } from './relay-submission-tracker.js';
+import {
+  RelaySubmissionTracker,
+  RelayInFlightError,
+  RelayOrderBusyError,
+  RelayConfirmationTimeoutError,
+  FileRelaySubmissionStore,
+  type RelayAction,
+  type RelaySubmissionStore,
+} from './relay-submission-tracker.js';
+import { createRelayConfirmer, stageStellarTransaction, stageEthereumTransaction } from './relay-submission-port.js';
+import { prepareXlmRefund } from './xlm-refund.js';
 
 // Contract addresses
 const ETH_TO_XLM_RATE = 10000; // 1 ETH = 10,000 XLM (LEGACY - now using real-time prices)
@@ -483,11 +498,19 @@ function validateConfig() {
 }
 
 /**
- * Idempotent submission tracker for cross-chain relays.
+ * Single-flight submission tracker for cross-chain relays.
  *
- * Gives every relay action a stable fingerprint, bounds retries to a
- * configurable budget, and remembers terminal success/failure so a timed-out
- * or ambiguous RPC call can never re-broadcast the same action indefinitely.
+ * This is the *only* door that may broadcast for an order. The request
+ * handlers, the recovery service and the refund watchdog all submit through
+ * it, which is what enforces "one claim or one refund per order":
+ *
+ *  - the submission key is (orderId, side, action), so a re-priced or
+ *    re-derived attempt of the same action lands in the same slot;
+ *  - the transaction hash is computed locally and persisted *before* the
+ *    broadcast, so a crash or an ambiguous RPC leaves a hash to reconcile;
+ *  - a retry polls that stored hash instead of broadcasting again;
+ *  - a second, different action on the same order is refused outright.
+ *
  * Retry budget defaults reuse the existing RELAYER_RETRY_* env vars.
  */
 const TERMINAL_ERROR_PATTERNS = [
@@ -497,17 +520,93 @@ const TERMINAL_ERROR_PATTERNS = [
   'invalid',
 ];
 
+/**
+ * Where submission records are persisted so a restart cannot forget a hash it
+ * already broadcast. Set `RELAYER_SUBMISSION_STORE_PATH=off` to disable
+ * persistence (single-process deployments only — losing it re-opens the
+ * double-spend window a redeploy would otherwise create).
+ */
+function createSubmissionStore(): RelaySubmissionStore | undefined {
+  const configured = (process.env.RELAYER_SUBMISSION_STORE_PATH ?? '').trim();
+  if (configured.toLowerCase() === 'off' || configured.toLowerCase() === 'none') {
+    console.warn(
+      '⚠️  Relay submission persistence disabled (RELAYER_SUBMISSION_STORE_PATH=off). ' +
+        'A restart will forget broadcast hashes and could resubmit a settled payment.'
+    );
+    return undefined;
+  }
+  const filePath = configured || resolve(process.cwd(), 'relay-submissions.json');
+  return new FileRelaySubmissionStore({ filePath, logger: console });
+}
+
+function resolveStellarHorizon(network?: string): string {
+  const mode = network === 'mainnet' ? 'mainnet' : network === 'testnet' ? 'testnet' : DEFAULT_NETWORK_MODE;
+  return NETWORK_CONFIG[mode === 'mainnet' ? 'mainnet' : 'testnet'].stellar.horizonUrl;
+}
+
+async function getStellarServer(network?: string) {
+  const { Horizon } = await import('@stellar/stellar-sdk');
+  return new Horizon.Server(resolveStellarHorizon(network));
+}
+
+async function getEthereumProvider(network?: string) {
+  const url = await resolveEthereumRpcUrl(network === 'testnet' ? 'testnet' : 'mainnet');
+  return new ethers.JsonRpcProvider(url);
+}
+
 export const relaySubmissionTracker = new RelaySubmissionTracker({
   maxAttempts: RELAYER_CONFIG.retryAttempts,
   retryDelayMs: RELAYER_CONFIG.retryDelay,
+  pollIntervalMs: Math.max(2_000, Math.floor(RELAYER_CONFIG.retryDelay / 2)),
   timeoutMs: RELAYER_CONFIG.rpcTimeoutMs,
   backoff: true,
+  confirm: createRelayConfirmer({ getStellarServer, getEthereumProvider }),
+  store: createSubmissionStore(),
   isRetryable: (err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     return !TERMINAL_ERROR_PATTERNS.some(p => message.toLowerCase().includes(p.toLowerCase()));
   },
   logger: console,
 });
+
+/**
+ * Build a submitter for the recovery service.
+ *
+ * The recovery service's on-chain execution is still a dry run
+ * (`recovery-service.ts` logs and resolves), so there is no transaction to
+ * stage and no hash to record — writing a synthetic hash would occupy the
+ * order's single-flight slot with a value no node will ever know about and
+ * would block the real refund for that order.
+ *
+ * It still goes through the tracker's order lock as a gate: if a claim or a
+ * refund is already live or settled for the order, recovery yields with
+ * `RelayOrderBusyError` instead of racing it. When recovery gains real
+ * execution, this must become a staged submission
+ * (`stageStellarTransaction` / `stageEthereumTransaction`) so the hash is
+ * recorded before the broadcast.
+ */
+function createRecoverySubmitter(): RecoverySubmitter {
+  return async ({ orderId, side, action, chain, reason, execute }) => {
+    const recoveryAction: RelayAction = {
+      orderId,
+      side,
+      action,
+      chain,
+      extra: { source: 'recovery-service', reason },
+    };
+    const blocking = relaySubmissionTracker.getBlockingRecord(recoveryAction);
+    if (blocking) {
+      throw new RelayOrderBusyError(recoveryAction, blocking);
+    }
+    return execute();
+  };
+}
+
+/**
+ * The refund watchdog handle, kept at module scope so `gracefulShutdown` can
+ * stop its timer before the process exits.
+ */
+let refundWatchdog: RefundWatchdogHandle | null = null;
 
 // Initialize relayer service
 async function initializeRelayer() {
@@ -827,7 +926,10 @@ async function initializeRelayer() {
     try {
       console.log('🔍 RAW REQUEST BODY:', JSON.stringify(req.body, null, 2));
       
-      const { fromChain, toChain, fromToken, toToken, amount, ethAddress, stellarAddress, direction, exchangeRate, network, networkMode } = req.body;
+      const {
+        fromChain, toChain, fromToken, toToken, amount, ethAddress, stellarAddress,
+        direction, exchangeRate, network, networkMode, coordinatorQuoteId, relayerQuote
+      } = req.body;
       
       console.log('🎯 EXTRACTED VALUES:', {
         amount: amount,
@@ -925,7 +1027,7 @@ async function initializeRelayer() {
               contractType: 'MOCK_1INCH_ESCROW_FACTORY'
             };
             
-            await storeActiveOrder(orderId, orderData);
+            await storeActiveOrder(orderId, { ...orderData, coordinatorQuoteId, relayerQuote });
             
             return res.json({
               success: true,
@@ -1028,7 +1130,9 @@ async function initializeRelayer() {
           // ✅ Add networkMode for XLM→ETH processing
           await storeActiveOrder(orderId, {
             ...orderData,
-            networkMode: requestNetwork
+            networkMode: requestNetwork,
+            coordinatorQuoteId,
+            relayerQuote
           });
           
           const totalCost = userAmountWei + actualSafetyDeposit;
@@ -1115,7 +1219,7 @@ async function initializeRelayer() {
           amount: (parseFloat(amount) * 1e18).toString(),
           hashLock,
           timelock: Math.floor(Date.now() / 1000) + 7201, // 2+ hours,
-          stellarTimelock: Math.floor(Date.now() / 1000) + (1 * 60 * 60) // 1 hour (dst expires before src)
+          stellarTimelock: Math.floor(Date.now() / 1000) + (1 * 60 * 60), // 1 hour (dst expires before src)
           feeRate: 100, // 1%
           beneficiary: stellarAddress,
           refundAddress: normalizedEthAddress,
@@ -1145,7 +1249,9 @@ async function initializeRelayer() {
           stellarAddress,
           amount: orderData.amount,  // ✅ Use wei format, not decimal string
           exchangeRate: exchangeRate || ETH_TO_XLM_RATE,
-          networkMode: requestNetwork  // ✅ Store network for XLM→ETH processing
+          networkMode: requestNetwork,  // ✅ Store network for XLM→ETH processing
+          coordinatorQuoteId,
+          relayerQuote
         });
 
         console.log('✅ TESTNET ETH→XLM Order created:', orderId);
@@ -1254,7 +1360,7 @@ async function initializeRelayer() {
             contractType: 'MOCK_DUAL_HTLC'
           };
           
-          await storeActiveOrder(orderId, orderData);
+          await storeActiveOrder(orderId, { ...orderData, coordinatorQuoteId, relayerQuote });
 
           return res.json({
             success: true,
@@ -1340,7 +1446,7 @@ async function initializeRelayer() {
           }
         };
 
-        await storeActiveOrder(orderId, orderData);
+        await storeActiveOrder(orderId, { ...orderData, coordinatorQuoteId, relayerQuote });
 
         res.json({
           success: true,
@@ -1617,84 +1723,71 @@ async function initializeRelayer() {
             gasLimit: 21000,
             gasPrice: ethers.parseUnits('20', 'gwei')
           };
-          
-          // Send transaction with retry for rate limiting
-          let ethTxResponse;
-          let retryCount = 0;
-          const maxRetries = 3;
-          
-          while (retryCount <= maxRetries) {
-            try {
-              ethTxResponse = await relayerWallet.sendTransaction(tx);
-              break; // Success, exit retry loop
-            } catch (txError: any) {
-              retryCount++;
-              
-              // Enhanced Alchemy rate limiting detection
-              const isRateLimit = txError.code === 'UNKNOWN_ERROR' && txError.error?.code === 429 ||
-                                txError.code === 429 ||
-                                txError.message?.includes('exceeded') ||
-                                txError.message?.includes('compute units') ||
-                                txError.message?.includes('rate limit') ||
-                                txError.error?.message?.includes('exceeded');
-              
-              if (isRateLimit && retryCount <= maxRetries) {
-                const delayMs = Math.pow(2, retryCount) * 1000; // Exponential backoff: 2s, 4s, 8s
-                console.log(`⏳ Alchemy rate limit detected (process endpoint, attempt ${retryCount}/${maxRetries}). Error:`, txError.message || txError.error?.message);
-                console.log(`⏳ Waiting ${delayMs}ms before retry...`);
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-                continue;
-              }
-              
-              // If not rate limiting or exhausted retries, throw
-              console.error('❌ Transaction failed after retries (process endpoint):', txError);
-              throw txError;
+
+          // Release ETH through the shared submission tracker. The tracker
+          // signs locally, records the transaction hash before broadcasting, and
+          // reconciles that hash on retry — so a duplicated /process call, a
+          // rate-limited RPC, or a relay restart can never pay the user twice.
+          const releaseAction: RelayAction = {
+            orderId,
+            side: 'xlm_to_eth',
+            action: 'claim',
+            chain: 'ethereum',
+            network: orderNetworkMode,
+            destination: userEthAddress,
+            amount: ethers.formatEther(ethAmount),
+          };
+
+          let ethTxHash: string;
+          try {
+            const release = await relaySubmissionTracker.submit(
+              releaseAction,
+              () =>
+                stageEthereumTransaction({
+                  wallet: relayerWallet as never,
+                  provider: relayerWallet.provider as never,
+                  request: tx,
+                  network: orderNetworkMode,
+                })
+            );
+            ethTxHash = release.txHash as string;
+            if (release.duplicate) {
+              console.log('↪️  ETH release already broadcast for this order:', ethTxHash);
             }
-          }
-          console.log('📤 ETH transaction sent:', ethTxResponse.hash);
-          
-          // Wait for confirmation with retry logic
-          let ethTxReceipt;
-          let confirmRetryCount = 0;
-          const maxConfirmRetries = 3;
-          
-          while (confirmRetryCount <= maxConfirmRetries) {
-            try {
-              ethTxReceipt = await ethTxResponse.wait();
-              console.log('✅ ETH transaction confirmed!');
-              break;
-            } catch (confirmError: any) {
-              confirmRetryCount++;
-              
-              // Check for rate limiting during confirmation
-              const isRateLimit = confirmError.code === 429 ||
-                                confirmError.message?.includes('exceeded') ||
-                                confirmError.message?.includes('rate limit');
-              
-              if (isRateLimit && confirmRetryCount <= maxConfirmRetries) {
-                const delayMs = Math.pow(2, confirmRetryCount) * 1000;
-                console.log(`⏳ Rate limit during confirmation (process endpoint, attempt ${confirmRetryCount}/${maxConfirmRetries}). Waiting ${delayMs}ms...`);
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-                continue;
-              }
-              
-              // If not rate limiting or exhausted retries, throw
-              console.error('❌ Transaction confirmation failed (process endpoint):', confirmError);
-              throw confirmError;
+          } catch (releaseError: any) {
+            if (releaseError instanceof RelayInFlightError) {
+              return res.status(409).json({
+                error: 'ETH release already in progress for this order',
+                orderId,
+              });
             }
+            if (releaseError instanceof RelayConfirmationTimeoutError) {
+              return res.status(202).json({
+                success: true,
+                pending: true,
+                orderId,
+                ethTxId: releaseError.txHash,
+                message: 'ETH release broadcast and awaiting confirmation. It will not be re-sent.',
+              });
+            }
+            // Terminal failure: the release is known-dead, so the funds can be
+            // recovered. The order lock is released by the tracker.
+            console.error('❌ ETH release failed (process endpoint):', releaseError);
+            throw releaseError;
           }
-          console.log('🔍 ETH tx hash:', ethTxReceipt?.hash);
-          console.log('🌐 View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxReceipt?.hash);
+          console.log('📤 ETH transaction sent:', ethTxHash);
+          console.log('✅ ETH transaction confirmed!');
+          console.log('🌐 View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxHash);
           
           // Update order status
           storedOrder.status = 'completed';
-          storedOrder.ethTxHash = ethTxReceipt?.hash;
+          storedOrder.ethTxHash = ethTxHash;
           
           // Success response
           res.json({
             success: true,
             orderId,
-            ethTxId: ethTxReceipt?.hash,
+            ethTxId: ethTxHash,
             message: 'Cross-chain swap completed successfully!',
             details: {
               stellar: {
@@ -1702,7 +1795,7 @@ async function initializeRelayer() {
                 status: 'confirmed'
               },
               ethereum: {
-                txId: ethTxReceipt?.hash,
+                txId: ethTxHash,
                 amount: `${ethers.formatEther(ethAmount)} ETH`,
                 destination: userEthAddress,
                 status: 'completed'
@@ -1795,25 +1888,32 @@ async function initializeRelayer() {
         console.log('📝 Transaction signed');
         console.log('💫 Sending XLM to:', userStellarAddress);
         
-        // Submit to network — idempotent with a bounded retry budget so a
-        // timed-out RPC call cannot re-broadcast this payment indefinitely and
-        // a duplicate /process request is reported as already handled.
-        let result: any;
+        // Submit through the shared submission tracker. The payment is staged
+        // (hash computed locally) and the tracker records the hash, network and
+        // a `pending` status *before* the broadcast, so an ambiguous submit is
+        // reconciled by polling that hash rather than by paying twice.
+        let payoutTxHash: string;
+        let payoutResult: any;
         try {
-          const submission = await relaySubmissionTracker.submit(
+          const submission = await quoterService.submitIfCoordinatorQuoteMatches(
+            storedOrder.relayerQuote as QuoteResponse | undefined,
+            storedOrder.coordinatorQuoteId as string | undefined,
             {
-              kind: 'eth->xlm',
               orderId,
+              side: 'eth_to_xlm',
+              action: 'claim',
               chain: 'stellar',
+              network: dynamicNetwork,
               destination: userStellarAddress,
               amount: xlmAmount,
-              extra: { network: dynamicNetwork },
             },
+            relaySubmissionTracker,
             () => server.submitTransaction(transaction)
           );
-          result = submission.result;
+          payoutResult = submission.result;
+          payoutTxHash = submission.txHash ?? payoutResult?.hash;
           if (submission.duplicate) {
-            console.log('↪️  Order already relayed; returning existing Stellar tx:', result.hash);
+            console.log('↪️  Order already relayed; returning existing Stellar tx:', payoutTxHash);
           }
         } catch (submitError: any) {
           if (submitError instanceof RelayInFlightError) {
@@ -1822,24 +1922,35 @@ async function initializeRelayer() {
               orderId,
             });
           }
-          // RelayTerminalError (budget exhausted / non-retryable) and any other
-          // failure fall through to the handler's outer catch for a 500.
+          if (submitError instanceof RelayConfirmationTimeoutError) {
+            // The payment is live but unconfirmed. The order lock stays held so
+            // no refund can race it; tell the client to poll instead of retry.
+            return res.status(202).json({
+              success: true,
+              pending: true,
+              orderId,
+              stellarTxId: submitError.txHash,
+              message: 'Payment broadcast and awaiting Stellar confirmation. It will not be re-sent.',
+            });
+          }
+          // RelayTerminalError (dead transaction / never observed) and any other
+          // failure fall through to the handler's outer catch for a 500/502.
           throw submitError;
         }
         console.log('✅ Stellar transaction successful!');
-        console.log('🔍 Transaction hash:', result.hash);
+        console.log('🔍 Transaction hash:', payoutTxHash);
         console.log('🌐 View on StellarExpert: https://stellar.expert/explorer/' +
-          (DEFAULT_NETWORK_MODE === 'mainnet' ? 'public' : 'testnet') + '/tx/' + result.hash);
+          (DEFAULT_NETWORK_MODE === 'mainnet' ? 'public' : 'testnet') + '/tx/' + payoutTxHash);
         
         // Update order status
         storedOrder.status = 'completed';
-        storedOrder.stellarTxHash = result.hash;
+        storedOrder.stellarTxHash = payoutTxHash;
         
         // Successful response
         res.json({
           success: true,
           orderId,
-          stellarTxId: result.hash,
+          stellarTxId: payoutTxHash,
           message: 'Cross-chain swap completed successfully!',
           details: {
             ethereum: {
@@ -1847,7 +1958,7 @@ async function initializeRelayer() {
               status: 'confirmed'
             },
             stellar: {
-              txId: result.hash,
+              txId: payoutTxHash,
               amount: `${xlmAmount} XLM`,
               destination: userStellarAddress,
               status: 'completed'
@@ -2143,55 +2254,65 @@ async function initializeRelayer() {
           });
         }
         
-        // Send transaction with retry for rate limiting
-        let ethTxResponse;
-        let txRetryCount = 0;
-        const maxTxRetries = 3;
-        
-        while (txRetryCount <= maxTxRetries) {
-          try {
-            ethTxResponse = await withTimeout(
-              relayerWallet.sendTransaction(tx),
-              RELAYER_CONFIG.rpcTimeoutMs,
-              'RPC sendTransaction timeout'
-            );
-            break; // Success, exit retry loop
-          } catch (txError: any) {
-            txRetryCount++;
-            
-            // Enhanced Alchemy rate limiting detection
-            const isRateLimit = txError.code === 'UNKNOWN_ERROR' && txError.error?.code === 429 ||
-                              txError.code === 429 ||
-                              txError.message?.includes('exceeded') ||
-                              txError.message?.includes('compute units') ||
-                              txError.message?.includes('rate limit') ||
-                              txError.error?.message?.includes('exceeded');
-            
-            if (isRateLimit && txRetryCount <= maxTxRetries) {
-              const delayMs = Math.pow(2, txRetryCount) * 1000; // Exponential backoff: 2s, 4s, 8s
-              console.log(`⏳ Alchemy rate limit detected (attempt ${txRetryCount}/${maxTxRetries}). Error:`, txError.message || txError.error?.message);
-              console.log(`⏳ Waiting ${delayMs}ms before retry...`);
-              await new Promise(resolve => setTimeout(resolve, delayMs));
-              continue;
-            }
-            
-            // If not rate limiting or exhausted retries, throw
-            console.error('❌ Transaction failed after retries:', txError);
-            throw txError;
+        // Release ETH through the shared submission tracker. The hash is signed
+        // and persisted before the broadcast, so a duplicate POST, a rate-limit
+        // retry, or a relay restart reconciles the existing hash instead of
+        // sending a second ETH transfer.
+        let ethTxHash: string;
+        try {
+          const release = await relaySubmissionTracker.submit(
+            {
+              orderId,
+              side: 'xlm_to_eth',
+              action: 'claim',
+              chain: 'ethereum',
+              network: orderNetworkMode,
+              destination: userEthAddress,
+              amount: ethers.formatEther(ethAmount),
+            },
+            () =>
+              stageEthereumTransaction({
+                wallet: relayerWallet as never,
+                provider: relayerWallet.provider as never,
+                request: tx,
+                network: orderNetworkMode,
+              })
+          );
+          ethTxHash = release.txHash as string;
+          if (release.duplicate) {
+            console.log('↪️  ETH release already broadcast for this order:', ethTxHash);
           }
+        } catch (releaseError: any) {
+          if (releaseError instanceof RelayInFlightError) {
+            return res.status(409).json({
+              error: 'ETH release already in progress for this order',
+              orderId,
+            });
+          }
+          if (releaseError instanceof RelayConfirmationTimeoutError) {
+            return res.status(202).json({
+              success: true,
+              pending: true,
+              orderId,
+              ethTxId: releaseError.txHash,
+              message: 'ETH release broadcast and awaiting confirmation. It will not be re-sent.',
+            });
+          }
+          console.error('❌ Transaction failed after retries:', releaseError);
+          throw releaseError;
         }
-        console.log('📤 ETH transaction sent:', ethTxResponse.hash);
-        console.log('🌐 View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxResponse.hash);
+        console.log('📤 ETH transaction sent:', ethTxHash);
+        console.log('🌐 View on Etherscan: https://sepolia.etherscan.io/tx/' + ethTxHash);
         
         if (storedOrder) {
           storedOrder.status = 'eth_tx_sent';
-          storedOrder.ethTxHash = ethTxResponse.hash;
+          storedOrder.ethTxHash = ethTxHash;
         }
         
         res.json({
           success: true,
           orderId,
-          ethTxId: ethTxResponse.hash,
+          ethTxId: ethTxHash,
           message: 'XLM→ETH transfer broadcasted',
           details: {
             stellar: {
@@ -2199,7 +2320,7 @@ async function initializeRelayer() {
               status: 'confirmed'
             },
             ethereum: {
-              txId: ethTxResponse.hash,
+              txId: ethTxHash,
               amount: `${ethers.formatEther(ethAmount)} ETH`,
               destination: userEthAddress,
               status: 'pending'
@@ -2221,6 +2342,12 @@ async function initializeRelayer() {
 
         // 🆘 AUTOMATIC XLM REFUND: User sent XLM but we couldn't send ETH.
         // Refund the XLM back to the user to prevent fund loss.
+        //
+        // The refund goes through the same tracker entry as the watchdog and
+        // the manual endpoint — (orderId, side, action) — so the order can only
+        // ever produce one refund. Crucially, the tracker refuses it here while
+        // the ETH release is still unresolved: paying a refund for a release
+        // that later lands would hand the user both legs.
         let refundResult: any = null;
         let refundError: any = null;
 
@@ -2228,11 +2355,7 @@ async function initializeRelayer() {
           console.log('🔄 Attempting automatic XLM refund to user...');
           console.log('🎯 Refunding to stellar address:', stellarAddress);
 
-          const { Horizon, Keypair, Asset, Operation, TransactionBuilder, Networks, BASE_FEE, Memo } = await import('@stellar/stellar-sdk');
-
           const networkModeForRefund = requestNetwork || storedOrder?.networkMode || DEFAULT_NETWORK_MODE;
-          const stellarRefundConfig = NETWORK_CONFIG[networkModeForRefund === 'mainnet' ? 'mainnet' : 'testnet'].stellar;
-          const refundServer = new Horizon.Server(stellarRefundConfig.horizonUrl);
 
           const refundSecretKey = networkModeForRefund === 'mainnet'
             ? (process.env.RELAYER_STELLAR_SECRET_MAINNET || process.env.RELAYER_STELLAR_SECRET)
@@ -2242,52 +2365,42 @@ async function initializeRelayer() {
             throw new Error(`Relayer Stellar secret not configured for ${networkModeForRefund}`);
           }
 
-          const refundKeypair = Keypair.fromSecret(refundSecretKey);
-          const refundAccount = await refundServer.loadAccount(refundKeypair.publicKey());
-
-          // Look up original XLM transaction to determine refund amount
-          let refundXlmAmount: string;
-          try {
-            const originalTx = await refundServer.transactions().transaction(stellarTxHash).call();
-            const ops = await refundServer.operations().forTransaction(stellarTxHash).call();
-            const paymentOp: any = ops.records.find((op: any) =>
-              op.type === 'payment' &&
-              op.to === refundKeypair.publicKey() &&
-              op.asset_type === 'native'
-            );
-
-            if (paymentOp) {
-              // Refund 99.99% to cover stellar tx fees (~0.00001 XLM)
-              const original = parseFloat(paymentOp.amount);
-              refundXlmAmount = (original - 0.0001).toFixed(7);
-              console.log(`💰 Original XLM amount: ${paymentOp.amount}, refunding: ${refundXlmAmount}`);
-            } else {
-              throw new Error('Could not find original XLM payment in transaction');
-            }
-          } catch (lookupErr: any) {
-            console.warn('⚠️ Could not look up original XLM amount, using order amount as fallback');
-            // Fallback: use order amount if available
-            refundXlmAmount = storedOrder?.amount ? String(storedOrder.amount) : '0.1';
-          }
-
-          const networkPassphraseForRefund = networkModeForRefund === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
-          const refundPayment = Operation.payment({
+          const refundAction: RelayAction = {
+            orderId,
+            side: 'xlm_to_eth',
+            action: 'refund',
+            chain: 'stellar',
+            network: networkModeForRefund,
             destination: stellarAddress,
-            asset: Asset.native(),
-            amount: refundXlmAmount
-          });
+            extra: { source: 'inline-xlm-refund', stellarTxHash },
+          };
 
-          const refundTransaction = new TransactionBuilder(refundAccount, {
-            fee: BASE_FEE,
-            networkPassphrase: networkPassphraseForRefund
-          })
-            .addOperation(refundPayment)
-            .addMemo(Memo.text(`Refund:${(orderId || 'unknown').substring(0, 20)}`))
-            .setTimeout(300)
-            .build();
+          const refundSubmission = await relaySubmissionTracker.submit(
+            refundAction,
+            async () => {
+              const { Horizon } = await import('@stellar/stellar-sdk');
+              const horizonUrl = NETWORK_CONFIG[
+                networkModeForRefund === 'mainnet' ? 'mainnet' : 'testnet'
+              ].stellar.horizonUrl;
+              const prepared = await prepareXlmRefund({
+                orderId: orderId || 'unknown',
+                stellarAddress,
+                stellarTxHash,
+                networkMode: networkModeForRefund,
+                horizonUrl,
+                refundSecret: refundSecretKey,
+                fallbackXlmAmount: storedOrder?.amount ? String(storedOrder.amount) : undefined,
+              });
+              return stageStellarTransaction({
+                server: new Horizon.Server(horizonUrl),
+                transaction: prepared.transaction,
+                network: networkModeForRefund,
+                label: 'inline xlm refund',
+              });
+            }
+          );
 
-          refundTransaction.sign(refundKeypair);
-          refundResult = await refundServer.submitTransaction(refundTransaction);
+          refundResult = { hash: refundSubmission.txHash, amount: refundSubmission.result?.amount };
           console.log('✅ Automatic XLM refund successful:', refundResult.hash);
 
           if (storedOrder) {
@@ -2295,8 +2408,15 @@ async function initializeRelayer() {
             storedOrder.refundTxHash = refundResult.hash;
           }
         } catch (refundErr: any) {
-          console.error('❌ Automatic XLM refund failed:', refundErr);
-          refundError = refundErr.message || 'Refund failed';
+          if (refundErr instanceof RelayOrderBusyError) {
+            // The ETH release for this order is still live or already settled.
+            // Refunding now would pay the user twice.
+            console.warn('🚫 Automatic XLM refund refused:', refundErr.message);
+            refundError = refundErr.message;
+          } else {
+            console.error('❌ Automatic XLM refund failed:', refundErr);
+            refundError = refundErr.message || 'Refund failed';
+          }
         }
 
         res.status(500).json({
@@ -2338,7 +2458,7 @@ async function initializeRelayer() {
   // Allows users to recover XLM that was sent but ETH could not be released
   app.post('/api/orders/manual-refund', async (req, res) => {
     try {
-      const { stellarTxHash, stellarAddress, networkMode } = req.body;
+      const { stellarTxHash, stellarAddress, networkMode, orderId: requestedOrderId } = req.body;
 
       if (!stellarTxHash || !stellarAddress) {
         return res.status(400).json({
@@ -2349,10 +2469,12 @@ async function initializeRelayer() {
       const refundNetwork = networkMode || DEFAULT_NETWORK_MODE;
       console.log('🆘 Manual refund requested:', { stellarTxHash, stellarAddress, refundNetwork });
 
-      const { Horizon, Keypair, Asset, Operation, TransactionBuilder, Networks, BASE_FEE, Memo } = await import('@stellar/stellar-sdk');
+      const { Keypair } = await import('@stellar/stellar-sdk');
 
       const stellarConfig = NETWORK_CONFIG[refundNetwork === 'mainnet' ? 'mainnet' : 'testnet'].stellar;
-      const server = new Horizon.Server(stellarConfig.horizonUrl);
+      const horizonUrl = stellarConfig.horizonUrl;
+      const { Horizon } = await import('@stellar/stellar-sdk');
+      const server = new Horizon.Server(horizonUrl);
 
       const relayerSecretKey = refundNetwork === 'mainnet'
         ? (process.env.RELAYER_STELLAR_SECRET_MAINNET || process.env.RELAYER_STELLAR_SECRET)
@@ -2367,6 +2489,18 @@ async function initializeRelayer() {
 
       const relayerKeypair = Keypair.fromSecret(relayerSecretKey);
       const relayerPublicKey = relayerKeypair.publicKey();
+
+      // Resolve the order this refund belongs to so the manual refund shares
+      // the tracker's single-flight slot with the inline handler and the
+      // watchdog. Falls back to the user's payment hash when the order is no
+      // longer in memory (e.g. after a relayer restart).
+      const matchedOrder = requestedOrderId
+        ? activeOrders.get(requestedOrderId)
+        : Array.from(activeOrders.entries()).find(([, o]: [string, any]) => o?.stellarTxHash === stellarTxHash);
+      const refundOrderId = requestedOrderId
+        || (matchedOrder?.orderId ? String(matchedOrder.orderId) : undefined)
+        || (Array.from(activeOrders.entries()).find(([, o]: [string, any]) => o?.stellarTxHash === stellarTxHash)?.[0])
+        || stellarTxHash;
 
       // Verify the original transaction was actually sent to this relayer
       let refundAmount: string;
@@ -2395,13 +2529,17 @@ async function initializeRelayer() {
         });
       }
 
-      // Check if this refund was already processed
+      // On-chain backstop. The tracker is the authoritative door (it also
+      // survives a relayer restart), but scanning the relayer account's recent
+      // memos catches refunds that landed before this process started. Both
+      // memo shapes are checked because the inline and manual paths write
+      // different prefixes.
       try {
         const transactions = await server.transactions().forAccount(relayerPublicKey).order('desc').limit(50).call();
-        const alreadyRefunded = transactions.records.some((tx: any) => {
-          return tx.memo === `Refund:${stellarTxHash.substring(0, 20)}` ||
-                 tx.memo === `ManualRefund:${stellarTxHash.substring(0, 20)}`;
-        });
+        const alreadyRefunded = transactions.records.some((tx: any) =>
+          tx.memo === `Refund:${refundOrderId.substring(0, 20)}` ||
+          tx.memo === `ManualRefund:${stellarTxHash.substring(0, 20)}`
+        );
         if (alreadyRefunded) {
           return res.status(409).json({
             error: 'Refund already processed for this transaction',
@@ -2412,37 +2550,87 @@ async function initializeRelayer() {
         console.warn('Could not check refund history, proceeding anyway:', e);
       }
 
-      // Build and send refund transaction
-      const relayerAccount = await server.loadAccount(relayerPublicKey);
-      const networkPassphrase = refundNetwork === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+      // Submit through the shared tracker: one refund per order, hash recorded
+      // before the payment is broadcast, and refused outright while the ETH
+      // release for this order is still live.
+      try {
+        const submission = await relaySubmissionTracker.submit(
+          {
+            orderId: refundOrderId,
+            side: 'xlm_to_eth',
+            action: 'refund',
+            chain: 'stellar',
+            network: refundNetwork,
+            destination: stellarAddress,
+            amount: refundAmount,
+            extra: { source: 'manual-refund', stellarTxHash },
+          },
+          async () => {
+            const { Asset, Operation, TransactionBuilder, Networks, BASE_FEE, Memo } = await import('@stellar/stellar-sdk');
+            const relayerAccount = await server.loadAccount(relayerPublicKey);
+            const networkPassphrase = refundNetwork === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+            const refundPayment = Operation.payment({
+              destination: stellarAddress,
+              asset: Asset.native(),
+              amount: refundAmount
+            });
+            const tx = new TransactionBuilder(relayerAccount, {
+              fee: BASE_FEE,
+              networkPassphrase
+            })
+              .addOperation(refundPayment)
+              .addMemo(Memo.text(`ManualRefund:${stellarTxHash.substring(0, 20)}`))
+              .setTimeout(300)
+              .build();
+            tx.sign(relayerKeypair);
+            return stageStellarTransaction({
+              server,
+              transaction: tx,
+              network: refundNetwork,
+              label: 'manual refund',
+            });
+          }
+        );
 
-      const refundPayment = Operation.payment({
-        destination: stellarAddress,
-        asset: Asset.native(),
-        amount: refundAmount
-      });
+        const refundTxHash = submission.txHash as string;
+        console.log('✅ Manual refund successful:', refundTxHash);
 
-      const tx = new TransactionBuilder(relayerAccount, {
-        fee: BASE_FEE,
-        networkPassphrase
-      })
-        .addOperation(refundPayment)
-        .addMemo(Memo.text(`ManualRefund:${stellarTxHash.substring(0, 20)}`))
-        .setTimeout(300)
-        .build();
+        if (matchedOrder) {
+          matchedOrder.status = 'refunded';
+          matchedOrder.refundTxHash = refundTxHash;
+          matchedOrder.refundedAt = Date.now();
+        }
 
-      tx.sign(relayerKeypair);
-      const result = await server.submitTransaction(tx);
-      console.log('✅ Manual refund successful:', result.hash);
-
-      res.json({
-        success: true,
-        refundTxHash: result.hash,
-        amount: refundAmount,
-        destination: stellarAddress,
-        network: refundNetwork,
-        message: 'XLM successfully refunded to your wallet'
-      });
+        res.json({
+          success: true,
+          refundTxHash,
+          amount: refundAmount,
+          destination: stellarAddress,
+          network: refundNetwork,
+          alreadyHandled: submission.duplicate,
+          message: 'XLM successfully refunded to your wallet'
+        });
+      } catch (refundError: any) {
+        if (refundError instanceof RelayOrderBusyError) {
+          // The ETH release for this order is live or already settled. Paying a
+          // refund now would hand the user both legs of the swap.
+          return res.status(409).json({
+            error: refundError.message,
+            stellarTxHash,
+            orderId: refundOrderId
+          });
+        }
+        if (refundError instanceof RelayConfirmationTimeoutError) {
+          return res.status(202).json({
+            success: true,
+            pending: true,
+            refundTxHash: refundError.txHash,
+            orderId: refundOrderId,
+            message: 'Refund broadcast and awaiting Stellar confirmation. It will not be re-sent.'
+          });
+        }
+        throw refundError;
+      }
     } catch (err: any) {
       console.error('❌ Manual refund failed:', err);
       res.status(500).json({
@@ -3102,6 +3290,8 @@ async function initializeRelayer() {
   // 🛡️ Refund watchdog: rescue stuck XLM→ETH orders that the request
   // loop failed to refund (e.g. user closed the tab, RPC outage past
   // our retry budget). Best-effort, never throws into the event loop.
+  // It shares the submission tracker with the request handlers, so it can
+  // never refund an order whose ETH release is still in flight.
   try {
     const watchdogNetwork: 'mainnet' | 'testnet' =
       (DEFAULT_NETWORK_MODE === 'mainnet' ? 'mainnet' : 'testnet');
@@ -3113,11 +3303,12 @@ async function initializeRelayer() {
         : (process.env.RELAYER_STELLAR_SECRET_TESTNET || process.env.RELAYER_STELLAR_SECRET);
 
     if (watchdogSecret) {
-      startRefundWatchdog({
+      refundWatchdog = startRefundWatchdog({
         horizonUrl: watchdogHorizon,
         refundSecret: watchdogSecret,
         networkMode: watchdogNetwork,
         activeOrders,
+        tracker: relaySubmissionTracker,
       });
     } else {
       console.warn('⚠️ Refund watchdog disabled: RELAYER_STELLAR_SECRET not configured.');
@@ -3139,6 +3330,16 @@ async function initializeRelayer() {
 async function gracefulShutdown() {
   console.log('\n🛑 Shutting down relayer service...');
   
+  // Stop the refund watchdog first so it cannot start a new submission while
+  // the process is tearing down. Submission records are already persisted, so
+  // any hash we recorded stays reconcilable after the restart.
+  try {
+    refundWatchdog?.stop();
+    console.log('✅ Refund watchdog stopped');
+  } catch (error) {
+    console.error('❌ Error stopping refund watchdog:', error);
+  }
+
   try {
     await ethereumListener.stopListening();
     console.log('✅ Ethereum listener stopped');
@@ -3191,8 +3392,10 @@ const recoveryConfig: RecoveryConfig = {
   gracePeriod: 300 // 5 minutes after timelock
 };
 
-// Initialize recovery service
-const recoveryService = new RecoveryService(ordersService, eventManager, recoveryConfig);
+// Initialize recovery service. Every on-chain step it wants to take is routed
+// through the shared submission tracker, so a recovery can never race a claim
+// or a watchdog refund for the same order.
+const recoveryService = new RecoveryService(ordersService, eventManager, recoveryConfig, createRecoverySubmitter());
 
 // Connect recovery service to event system
 recoveryService.on('recoveryCompleted', (event) => {
@@ -3831,16 +4034,37 @@ async function processEscrowToStellar(orderId: string, storedOrder: any) {
       .setTimeout(300)
       .build();
     
-    // Sign and submit
+    // Sign and submit through the shared tracker so an escrow completion can
+    // only ever produce one XLM payment, and a retry reconciles the recorded
+    // hash instead of paying the user again.
     transaction.sign(relayerKeypair);
-    const result = await server.submitTransaction(transaction);
-    
-    console.log('✅ XLM payment sent:', result.hash);
-    console.log('🌐 View on Stellar Explorer:', `https://stellarchain.io/transactions/${result.hash}`);
+    const submission = await relaySubmissionTracker.submit(
+      {
+        orderId,
+        side: 'eth_to_xlm',
+        action: 'claim',
+        chain: 'stellar',
+        network: 'mainnet',
+        destination: storedOrder.stellarAddress,
+        amount: xlmAmount,
+        extra: { source: 'escrow-bridge' },
+      },
+      () =>
+        stageStellarTransaction({
+          server,
+          transaction,
+          network: 'mainnet',
+          label: 'escrow bridge payout',
+        })
+    );
+
+    const payoutHash = submission.txHash as string;
+    console.log('✅ XLM payment sent:', payoutHash);
+    console.log('🌐 View on Stellar Explorer:', `https://stellarchain.io/transactions/${payoutHash}`);
     
     // Update order status
     storedOrder.status = 'completed';
-    storedOrder.stellarTxHash = result.hash;
+    storedOrder.stellarTxHash = payoutHash;
     storedOrder.completedAt = new Date().toISOString();
     
     console.log(`🎉 Escrow bridge completed for order ${orderId}!`);

@@ -64,7 +64,7 @@ export default function BackendStatusBanner({ statusState }: Props) {
         title="Retry"
         className="ml-2 inline-flex items-center gap-1 rounded px-2 py-1 opacity-70 transition-opacity hover:opacity-100 disabled:cursor-not-allowed"
       >
-        <RefreshCw className={`h-3 w-3 ${status === 'checking' ? 'animate-spin' : ''}`} />
+        <RefreshCw className={`j-3 w-3 ${status === 'checking' ? 'animate-spin' : ''}`} />
         Retry
       </button>
     </div>

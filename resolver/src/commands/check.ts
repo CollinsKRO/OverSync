@@ -1,13 +1,68 @@
 import { createPublicClient, http, parseAbi, type Address } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { sepolia, mainnet } from "viem/chains";
-import { rpc, Contract, Keypair, TransactionBuilder, Networks, nativeToScVal } from "@stellar/stellar-sdk";
+import { rpc, Contract, Keypair, TransactionBuilder, nativeToScVal, scValToNative } from "@stellar/stellar-sdk";
 import { loadConfig, type ResolverConfig } from "../config.js";
 import { getLogger } from "../logger.js";
 
 const REGISTRY_ABI = parseAbi([
   "function isActive(address resolver) view returns (bool)"
 ]);
+const ESCROW_ABI = parseAbi([
+  "function resolverRegistry() view returns (address)"
+]);
+
+/** Verify that each configured HTLC is bound to the registry this resolver uses. */
+export async function checkDeploymentAddresses(cfg: ResolverConfig): Promise<void> {
+  if (!cfg.ethereum.htlcEscrow) throw new Error("ETH_HTLC_ESCROW is not configured");
+  if (!cfg.ethereum.resolverRegistry) throw new Error("ETH_RESOLVER_REGISTRY is not configured");
+  if (!cfg.soroban.htlc) throw new Error("SOROBAN_HTLC is not configured");
+  if (!cfg.soroban.resolverRegistry) throw new Error("SOROBAN_RESOLVER_REGISTRY is not configured");
+  if (!cfg.soroban.resolverSecret) throw new Error("RESOLVER_STELLAR_SECRET is not configured");
+
+  let ethereumRegistry: Address;
+  try {
+    const chain = cfg.ethereum.chainId === 1 ? mainnet : sepolia;
+    const client = createPublicClient({ chain, transport: http(cfg.ethereum.rpcUrl) });
+    ethereumRegistry = await client.readContract({
+      address: cfg.ethereum.htlcEscrow,
+      abi: ESCROW_ABI,
+      functionName: "resolverRegistry"
+    });
+  } catch {
+    throw new Error("Could not read ETH_HTLC_ESCROW resolverRegistry");
+  }
+
+  let sorobanRegistry: unknown;
+  try {
+    const server = new rpc.Server(cfg.soroban.rpcUrl, { allowHttp: cfg.soroban.rpcUrl.startsWith("http://") });
+    const contract = new Contract(cfg.soroban.htlc);
+    const source = await server.getAccount(Keypair.fromSecret(cfg.soroban.resolverSecret).publicKey());
+    const tx = new TransactionBuilder(source, {
+      fee: "100",
+      networkPassphrase: cfg.soroban.networkPassphrase
+    })
+      .addOperation(contract.call("resolver_registry"))
+      .setTimeout(30)
+      .build();
+    const sim = await server.simulateTransaction(tx);
+    if (rpc.Api.isSimulationError(sim) || !sim.result?.retval) {
+      throw new Error("Simulation failed");
+    }
+    sorobanRegistry = scValToNative(sim.result.retval);
+  } catch {
+    throw new Error("Could not read SOROBAN_HTLC resolver_registry");
+  }
+
+  const mismatches: string[] = [];
+  if (ethereumRegistry.toLowerCase() !== cfg.ethereum.resolverRegistry.toLowerCase()) {
+    mismatches.push("ETH_RESOLVER_REGISTRY disagrees with ETH_HTLC_ESCROW");
+  }
+  if (sorobanRegistry !== cfg.soroban.resolverRegistry) {
+    mismatches.push("SOROBAN_RESOLVER_REGISTRY disagrees with SOROBAN_HTLC");
+  }
+  if (mismatches.length) throw new Error(mismatches.join("; "));
+}
 
 export type CheckResult = {
   chain: string;
@@ -196,6 +251,7 @@ export async function checkCommand(options?: { json?: boolean }): Promise<void> 
   const cfg = loadConfig();
   const log = getLogger(cfg.logLevel);
   log.info("Running resolver preflight checks...");
+  await checkDeploymentAddresses(cfg);
   const results = await checkPreflight();
 
   for (const r of results) {
@@ -214,6 +270,7 @@ export async function checkCommand(options?: { json?: boolean }): Promise<void> 
 async function checkCommandJson(): Promise<void> {
   try {
     const cfg = loadConfig();
+    await checkDeploymentAddresses(cfg);
     const results = await checkPreflight();
     const output = buildJsonOutput(results, cfg);
     console.log(JSON.stringify(output, null, 2));

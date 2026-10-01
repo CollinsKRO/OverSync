@@ -9,6 +9,12 @@ import type { SorobanConfig } from "../config.js";
  * poll `getEvents` every `pollIntervalMs`. The cursor is held in memory
  * — restarting the resolver re-fetches from the latest ledger, which is
  * fine because order state is durable on-chain.
+ *
+ * Any plan that would be submitted on Stellar MUST be re-validated
+ * against the canonical order with `validatePlanForSubmit`
+ * (`resolver/src/planner`) immediately before it is handed to the
+ * submission path. A plan that drifted, or whose timelock expired while
+ * it waited, is rejected and never submitted.
  */
 export class SorobanListener {
   private readonly server: rpc.Server;

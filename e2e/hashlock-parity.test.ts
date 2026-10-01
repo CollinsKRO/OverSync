@@ -1,34 +1,74 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
+import { hashOrderPreimage } from "@oversync/sdk/secrets";
+import { SorobanHtlcSim } from "./sim.js";
+import { startEvmFixture } from "./evm-fixture.js";
 import { runParityCheck } from "./hashlock-parity.js";
 
+const vectorLine = readFileSync(
+  fileURLToPath(new URL("./fixtures/hashlock-v1.tsv", import.meta.url)),
+  "utf8"
+).split("\n").find((line) => line && !line.startsWith("#"))!;
+const [vectorOrderId, vectorPreimage, vectorHashlock] = vectorLine.split("\t") as [
+  string,
+  `0x${string}`,
+  `0x${string}`
+];
+
 describe("hashlock parity check", () => {
-  it("generates a fresh secret and confirms all routes pass", () => {
-    const proof = runParityCheck();
+  it("matches the canonical shared order-bound hashlock vector", () => {
+    const orderId = BigInt(vectorOrderId);
+    const proof = runParityCheck(vectorPreimage, orderId);
 
-    expect(proof.preimage).toMatch(/^0x[0-9a-f]{64}$/);
-    expect(proof.sha256).toMatch(/^0x[0-9a-f]{64}$/);
-    expect(proof.keccak256).toMatch(/^0x[0-9a-f]{64}$/);
-    expect(proof.sha256).not.toBe(proof.keccak256);
-
-    expect(proof.evmCrossChainRoute).toBe(true);
-    expect(proof.evmNativeRoute).toBe(true);
-    expect(proof.sorobanRoute).toBe(true);
-    expect(proof.crossChainCompatible).toBe(true);
+    expect(proof.hashlock).toBe(vectorHashlock);
+    expect(hashOrderPreimage(orderId + 1n, vectorPreimage)).not.toBe(vectorHashlock);
   });
 
-  it("is deterministic for a given preimage", () => {
-    const preimage = "0x" + "ab".repeat(32) as `0x${string}`;
-    const a = runParityCheck(preimage);
-    const b = runParityCheck(preimage);
+  it("accepts matching preimages and rejects mutations and other-order preimages on both local sides", async () => {
+    const evm = await startEvmFixture();
+    const soroban = new SorobanHtlcSim();
+    const orderId = BigInt(vectorOrderId);
+    const proof = runParityCheck(vectorPreimage, orderId);
+    const changedBytes = Buffer.from(vectorPreimage.slice(2), "hex");
+    changedBytes[changedBytes.length - 1] ^= 1;
+    const changedPreimage = `0x${changedBytes.toString("hex")}` as `0x${string}`;
 
-    expect(a.sha256).toBe(b.sha256);
-    expect(a.keccak256).toBe(b.keccak256);
-  });
+    try {
+      const evmOrderId = await evm.nextOrderId();
+      const sorobanOrderId = soroban.nextOrderId();
+      expect(evmOrderId).toBe(orderId);
+      expect(sorobanOrderId).toBe(orderId);
+      await evm.createOrder(proof.hashlock, 600);
+      soroban.createOrder({ hashlock: proof.hashlock, timelockSeconds: 600 });
 
-  it("correctly reports crossChainCompatible when sha256 hashlock works on both chains", () => {
-    const proof = runParityCheck();
-    expect(proof.crossChainCompatible).toBe(true);
-    expect(proof.evmCrossChainRoute).toBe(true);
-    expect(proof.sorobanRoute).toBe(true);
+      expect(await evm.claimOrderExpectRevert(evmOrderId, changedPreimage)).toMatch(/InvalidPreimage/);
+      expect(() => soroban.claimOrder(sorobanOrderId, changedPreimage)).toThrow(/InvalidPreimage/);
+      await evm.claimOrder(evmOrderId, vectorPreimage);
+      soroban.claimOrder(sorobanOrderId, vectorPreimage);
+      expect(await evm.getOrderStatus(evmOrderId)).toBe("Claimed");
+      expect(soroban.getOrder(sorobanOrderId).status).toBe("Claimed");
+
+      const otherPreimage = `0x${"02".repeat(32)}` as `0x${string}`;
+      const nextEvmId = await evm.nextOrderId();
+      const nextSorobanId = soroban.nextOrderId();
+      const otherHashlock = hashOrderPreimage(nextEvmId, otherPreimage);
+      expect(nextEvmId).toBe(nextSorobanId);
+      await evm.createOrder(otherHashlock, 600);
+      soroban.createOrder({ hashlock: otherHashlock, timelockSeconds: 600 });
+
+      expect(await evm.claimOrderExpectRevert(nextEvmId, vectorPreimage)).toMatch(/InvalidPreimage/);
+      expect(() => soroban.claimOrder(nextSorobanId, vectorPreimage)).toThrow(/InvalidPreimage/);
+      await evm.claimOrder(nextEvmId, otherPreimage);
+      soroban.claimOrder(nextSorobanId, otherPreimage);
+    } finally {
+      await evm.stop();
+    }
+  }, 60_000);
+
+  it("is deterministic for a given order and preimage", () => {
+    const first = runParityCheck(vectorPreimage, BigInt(vectorOrderId));
+    const second = runParityCheck(vectorPreimage, BigInt(vectorOrderId));
+    expect(first.hashlock).toBe(second.hashlock);
   });
 });

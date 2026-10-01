@@ -1,8 +1,16 @@
 import { Router } from "express";
 import { z } from "zod";
 import type { SecretService } from "../../services/secret-service.js";
+import type { RequestHandler } from "express";
 
-export function secretsRoutes(secrets: SecretService): Router {
+export interface SecretsRoutesOptions {
+  /** CORS middleware to gate the secret route. */
+  cors?: RequestHandler;
+  /** Readiness rate limit middleware to apply before JSON parsing. */
+  rateLimit?: RequestHandler;
+}
+
+export function secretsRoutes(secrets: SecretService, options: SecretsRoutesOptions = {}): Router {
   const router = Router();
 
   const revealSchema = z.object({
@@ -11,7 +19,11 @@ export function secretsRoutes(secrets: SecretService): Router {
     txHash: z.string().min(1)
   });
 
-  router.post("/secrets/reveal", async (req, res, next) => {
+  const gates: RequestHandler[] = [];
+  if (options.cors) gates.push(options.cors);
+  if (options.rateLimit) gates.push(options.rateLimit);
+
+  router.post("/secrets/reveal", ...gates, async (req, res, next) => {
     try {
       const body = revealSchema.parse(req.body);
       await secrets.reveal(body.publicId, body.preimage, body.txHash);
@@ -19,6 +31,19 @@ export function secretsRoutes(secrets: SecretService): Router {
     } catch (err) {
       if (err instanceof z.ZodError) {
         res.status(400).json({ error: "validation_error", details: err.errors });
+        return;
+      }
+      // The state machine refused the reveal: the order is not escrowed yet,
+      // or it has already moved past the secret step (#252).
+      if (isTransitionRejection(err)) {
+        res.status(409).json({
+          error: "illegal_transition",
+          code: err.code,
+          from: err.from,
+          to: err.to,
+          action: err.action,
+          message: err.message
+        });
         return;
       }
       if (err instanceof Error) {

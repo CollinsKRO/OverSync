@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Clock, CheckCircle, XCircle, ArrowRight, ExternalLink, RefreshCw, Undo2, FileText } from 'lucide-react';
 import { isTestnet } from '../config/networks';
 import RefundDialog from '../features/refund/RefundDialog';
@@ -7,13 +7,18 @@ import OrderStaleBanner from './OrderStaleBanner';
 import HtlcReceiptCard from './HtlcReceiptCard';
 import { classifyOrderFreshness } from '../lib/orderFreshness';
 import { buildHtlcReceipt } from '../lib/parseHtlcReceipt';
+import {
+  buildHistoryQuery,
+  historyErrorFromResponse,
+  mergeHistoryPage,
+  readHistoryPage,
+} from '../lib/orderHistoryCursor';
 import type { Address } from 'viem';
 import HtlcTimeline from './HtlcTimeline';
 import {
-  fetchCoordinatorOrders,
   isRealHash,
   isRealTransaction,
-  mergeTransactions,
+  mapCoordinatorOrderToTransaction,
   type Transaction,
 } from '../lib/orderRecovery';
 
@@ -23,6 +28,7 @@ interface TransactionHistoryProps {
 }
 
 const STORAGE_KEY = 'oversync_transactions_v2';
+const HISTORY_PAGE_SIZE = 5;
 const PRODUCTION_API_BASE_URL = 'https://oversync-k36vx.ondigitalocean.app';
 const API_BASE_URL = import.meta.env.PROD
   ? ''
@@ -40,6 +46,18 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
   const [manualRefundingIds, setManualRefundingIds] = useState<Set<string>>(() => new Set());
   const [expandedTxIds, setExpandedTxIds] = useState<Set<string>>(new Set());
   const [receiptOpenIds, setReceiptOpenIds] = useState<Set<string>>(() => new Set());
+  // Opaque token for the next page, issued by the coordinator. Never built here.
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  // Mirrors `transactions` so a page can be folded into the list that is
+  // actually on screen. Paging must accumulate, and reading `transactions`
+  // from the fetch callback's closure would fold into a stale list.
+  const transactionsRef = useRef<Transaction[]>([]);
+
+  const commitTransactions = useCallback((next: Transaction[]) => {
+    transactionsRef.current = next;
+    setTransactions(next);
+  }, []);
 
   const isTxExpanded = (tx: Transaction): boolean => {
     if (expandedTxIds.has(tx.id + '_hidden')) {
@@ -83,31 +101,87 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
       return [];
     }
   }, []);
-
-  const refreshFromCoordinator = useCallback(async () => {
-    const local = loadFromStorage();
+  /**
+   * Fetch one page of coordinator history.
+   *
+   * `cursor` is the opaque token the coordinator handed back with the previous
+   * page; `null` means "start from the newest". It is passed in rather than
+   * read from state so the value used is always the one this request is for.
+   */
+  const fetchHistoryPage = useCallback(async (cursor: string | null, seedFromCache: boolean) => {
     if (!ethAddress && !stellarAddress) {
-      setTransactions(local);
+      commitTransactions(loadFromStorage());
+      setNextCursor(null);
+      setHistoryError(null);
       return;
     }
+
     setIsLoading(true);
     try {
-      const remote = await fetchCoordinatorOrders(API_BASE_URL, { ethAddress, stellarAddress });
-      const merged = mergeTransactions(local, remote);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
-      setTransactions(merged);
+      const query = buildHistoryQuery({
+        ethAddress,
+        stellarAddress,
+        network: isTestnet() ? 'testnet' : 'mainnet',
+        limit: HISTORY_PAGE_SIZE,
+        cursor,
+      });
+      const res = await fetch(`${API_BASE_URL}/api/orders/history?${query}`);
+
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw historyErrorFromResponse(res.status, body);
+
+      const page = readHistoryPage(body);
+      const remote: Transaction[] = page.orders
+        .map(mapCoordinatorOrderToTransaction)
+        .filter(isRealTransaction);
+
+      // Keyed by order id, so a row that shifted between pages shows up once.
+      // Earlier pages stay on the list: a page is added, never swapped in.
+      const local = loadFromStorage();
+      const base = seedFromCache
+        ? mergeHistoryPage<Transaction>(transactionsRef.current, local)
+        : transactionsRef.current;
+      const merged = mergeHistoryPage<Transaction>(base, remote).sort(
+        (a, b) => b.timestamp - a.timestamp
+      );
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+      } catch (err) {
+        console.warn('Could not persist transactions:', err);
+      }
+      commitTransactions(merged);
+      setNextCursor(page.nextCursor);
+      setHistoryError(null);
     } catch (err) {
-      console.warn('Coordinator history unavailable, falling back to local cache:', err);
-      setTransactions(local);
+      // A rejected cursor is a hard stop, not a fallback: rendering the local
+      // cache as if it were the next page would silently show a short list.
+      const message =
+        err instanceof Error ? err.message : 'Could not load transaction history from the coordinator.';
+      console.warn('Coordinator history unavailable:', err);
+      setHistoryError(message);
+      // A failed *later* page must leave the loaded pages untouched, so the
+      // user can tell the difference between "no more orders" and "we lost the
+      // cursor". Only a failed first page falls back to the local cache.
+      if (cursor === null) commitTransactions(loadFromStorage());
     } finally {
       setIsLoading(false);
     }
-  }, [ethAddress, stellarAddress, loadFromStorage]);
+  }, [ethAddress, stellarAddress, loadFromStorage, commitTransactions]);
+
+  const refreshFromCoordinator = useCallback(
+    () => fetchHistoryPage(null, true),
+    [fetchHistoryPage]
+  );
+
+  const loadMoreFromCoordinator = useCallback(async () => {
+    if (!nextCursor) return;
+    await fetchHistoryPage(nextCursor, false);
+  }, [fetchHistoryPage, nextCursor]);
 
   useEffect(() => {
-    setTransactions(loadFromStorage());
-    void refreshFromCoordinator();
-  }, [loadFromStorage, refreshFromCoordinator]);
+    commitTransactions(loadFromStorage());
+    void fetchHistoryPage(null, true);
+  }, [loadFromStorage, fetchHistoryPage, commitTransactions]);
 
   const getStatusColor = (status: Transaction['status']) => {
     switch (status) {
@@ -230,25 +304,23 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
     refundHash: string,
     refundNetwork: 'ethereum' | 'stellar'
   ) => {
-    setTransactions((prev) => {
-      const next = prev.map((tx) =>
-        tx.id === orderId
-          ? {
-              ...tx,
-              status: 'cancelled' as const,
-              refundTxHash: refundHash,
-              refundNetwork,
-              refundedAt: Date.now(),
-            }
-          : tx
-      );
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
+    const next = transactionsRef.current.map((tx) =>
+      tx.id === orderId
+        ? {
+            ...tx,
+            status: 'cancelled' as const,
+            refundTxHash: refundHash,
+            refundNetwork,
+            refundedAt: Date.now(),
+          }
+        : tx
+    );
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      /* ignore */
+    }
+    commitTransactions(next);
   };
 
   const handleManualXlmRefund = async (tx: Transaction) => {
@@ -310,7 +382,7 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
           </p>
         </div>
         <button
-          onClick={refreshFromCoordinator}
+          onClick={() => void refreshFromCoordinator()}
           disabled={isLoading}
           className="button-hover-scale flex items-center justify-center gap-2 rounded-full border border-cyan-200/30 bg-cyan-200/[0.12] px-4 py-2 text-sm font-semibold text-cyan-50 shadow-[0_12px_34px_rgba(0,226,255,0.12)] transition hover:border-cyan-100/45 hover:bg-cyan-200/[0.18] disabled:opacity-60"
         >
@@ -318,6 +390,16 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
           Refresh
         </button>
       </div>
+
+      {historyError && (
+        <div
+          role="alert"
+          className="mb-4 shrink-0 rounded-2xl border border-red-400/30 bg-red-500/10 px-4 py-3 text-sm text-red-100"
+        >
+          <p className="font-semibold">Could not load transaction history</p>
+          <p className="mt-1 text-red-100/80">{historyError}</p>
+        </div>
+      )}
 
       <div className="mb-4 flex shrink-0 gap-2 overflow-x-auto pb-1">
         {[
@@ -339,6 +421,17 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
           </button>
         ))}
       </div>
+
+      {cursor && !isLoading && (
+        <button
+          onClick={refreshFromCoordinator}
+          disabled={isLoading}
+          className="button-hover-scale flex items-center justify-center gap-2 rounded-full border border-cyan-200/30 bg-cyan-200/[0.12] px-4 py-2 text-sm font-semibold text-cyan-50 shadow-[0_12px_34px_rgba(0,226,255,0.12)] transition hover:border-cyan-100/45 hover:bg-cyan-200/[0.18] disabled:opacity-60"
+        >
+          <ArrowRight className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
+          Load More
+        </button>
+      )}
 
       <div className="min-h-0 space-y-3 overflow-y-auto overscroll-contain pr-1">
         {filteredTransactions.length === 0 ? (
@@ -383,9 +476,9 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                         <ExternalLink className="h-3 w-3 opacity-70" />
                       </a>
                       <CopyableIdentifier
-                        value={getEtherscanUrl(tx.ethTxHash)}
+                        value={tx.ethTxHash}
                         hideDisplay
-                        copyLabel="Etherscan URL"
+                        copyLabel="transaction hash"
                       />
                     </div>
                   )}
@@ -403,9 +496,9 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                         <ExternalLink className="h-3.5 w-3.5 opacity-70" />
                       </a>
                       <CopyableIdentifier
-                        value={getStellarExplorerUrl(tx.stellarTxHash)}
+                        value={tx.stellarTxHash}
                         hideDisplay
-                        copyLabel="Stellar Expert URL"
+                        copyLabel="transaction hash"
                       />
                     </div>
                   )}
@@ -489,9 +582,9 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                         <span>{getRefundNetworkLabel(tx)}</span>
                       </a>
                       <CopyableIdentifier
-                        value={getRefundExplorerUrl(tx)}
+                        value={tx.refundTxHash}
                         hideDisplay
-                        copyLabel="refund URL"
+                        copyLabel="transaction hash"
                       />
                     </div>
                   )}
@@ -554,9 +647,23 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
         )}
       </div>
 
+      {nextCursor && !historyError && (
+        <div className="mt-4 flex shrink-0 justify-center">
+          <button
+            onClick={() => void loadMoreFromCoordinator()}
+            disabled={isLoading}
+            className="button-hover-scale flex items-center justify-center gap-2 rounded-full border border-cyan-200/30 bg-cyan-200/[0.12] px-4 py-2 text-sm font-semibold text-cyan-50 shadow-[0_12px_34px_rgba(0,226,255,0.12)] transition hover:border-cyan-100/45 hover:bg-cyan-200/[0.18] disabled:opacity-60"
+          >
+            <ArrowRight className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
+            {isLoading ? 'Loading...' : 'Load more'}
+          </button>
+        </div>
+      )}
+
       {refundTarget && refundTarget.onChainOrderId && refundTarget.htlcContractAddress && refundTarget.timelockUnixSeconds && ethAddress && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <RefundDialog
+            coordinatorOrderId={refundTarget.id}
             userAddress={ethAddress as Address}
             orderId={refundTarget.onChainOrderId}
             timelockUnixSeconds={refundTarget.timelockUnixSeconds}

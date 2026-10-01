@@ -103,8 +103,22 @@ export function loadConfig(): ResolverConfig {
   logger.info(`Coordinator upstream mapping endpoint: ${redactUrl(config.coordinatorUrl)}`);
   logger.info(`Polling cycle state intervals: ${config.pollIntervalMs}ms`);
 
-  // Emits complete settings object topology (The deep hook in logger.ts strips secret keys instantly)
-  logger.info({ msg: "OverSync active module runtime mappings configuration payload", runtimeConfig: config });
+  logger.info({
+    msg: "OverSync active module runtime mappings configuration payload",
+    runtimeConfig: {
+      network: config.network,
+      pollIntervalMs: config.pollIntervalMs,
+      ethereum: {
+        chainId: config.ethereum.chainId,
+        htlcEscrow: config.ethereum.htlcEscrow,
+        resolverRegistry: config.ethereum.resolverRegistry
+      },
+      soroban: {
+        htlc: config.soroban.htlc,
+        resolverRegistry: config.soroban.resolverRegistry
+      }
+    }
+  });
 
   return config;
 }

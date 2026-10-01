@@ -16,7 +16,12 @@ import {
   Memo,
 } from '@stellar/stellar-sdk';
 import { Server } from '@stellar/stellar-sdk/lib/horizon/index.js';
-import { StellarHTLCManager, StellarConfig, HTLCClaimableBalanceParams } from './claimable-balance.js';
+import {
+  StellarHTLCManager,
+  StellarConfig,
+  HTLCClaimableBalanceParams,
+  buildEscrowTerms,
+} from './claimable-balance.js';
 
 /**
  * Enhanced bridge configuration
@@ -408,13 +413,21 @@ export class EnhancedStellarBridge {
     if (!orderState.stellarBalanceId) {
       throw new Error('Stellar balance ID not found');
     }
-    
+
+    const expected = buildEscrowTerms({
+      assetCode: orderState.params.stellarAssetCode,
+      assetIssuer: orderState.params.stellarAssetIssuer,
+      amount: orderState.params.stellarAmount,
+      claimant: orderState.params.stellarBeneficiary,
+    });
+
     const claimParams = {
       claimerSecretKey: this.config.relayerPrivateKey,
       balanceId: orderState.stellarBalanceId,
-      preimage
+      preimage,
+      expected,
     };
-    
+
     const txHash = await this.stellarManager.claimWithPreimage(claimParams);
     return { txHash };
   }
@@ -433,12 +446,20 @@ export class EnhancedStellarBridge {
     if (!orderState.stellarBalanceId) {
       throw new Error('Stellar balance ID not found');
     }
-    
+
+    const expected = buildEscrowTerms({
+      assetCode: orderState.params.stellarAssetCode,
+      assetIssuer: orderState.params.stellarAssetIssuer,
+      amount: orderState.params.stellarAmount,
+      claimant: orderState.params.stellarBeneficiary,
+    });
+
     const refundParams = {
       refunderSecretKey: this.config.relayerPrivateKey,
-      balanceId: orderState.stellarBalanceId
+      balanceId: orderState.stellarBalanceId,
+      expected,
     };
-    
+
     const txHash = await this.stellarManager.refundExpired(refundParams);
     return { txHash };
   }

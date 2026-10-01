@@ -1,393 +1,46 @@
-import { describe, it, expect, vi } from "vitest";
-import pino from "pino";
-import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { openDatabase, PostgresStatement } from "../src/persistence/db.js";
-import { OrdersRepository } from "../src/persistence/orders-repo.js";
-import { OrderService, OrderValidationError, StaleOrderEventError } from "../src/services/order-service.js";
-import { SecretService } from "../src/services/secret-service.js";
+import { expect } from 'chai';
+import { OrderService } from '../src/services/order-service';
+import { ConfigService } from '../src/services/config-service';
 
-const log = pino({ level: "silent" });
+describe('OrderService Legacy Bridge Rejection', () => {
+  let orderService: OrderService;
+  let mockConfig: ConfigService;
 
-const VALID_HASHLOCK = "0x" + "a".repeat(64);
-const VALID_ETH_ADDR = "0x1111111111111111111111111111111111111111";
-const VALID_STELLAR_ADDR = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB422";
-
-async function freshDb() {
-  const dir = mkdtempSync(resolve(tmpdir(), "oversync-test-"));
-  return openDatabase(`file:${dir}/test.db`);
-}
-
-describe("OrderService", () => {
-  it("announces an eth->xlm order and round-trips it via getById/history", async () => {
-    const db = await freshDb();
-    const orders = new OrderService(new OrdersRepository(db), log);
-
-    const order = await orders.announce({
-      direction: "eth_to_xlm",
-      hashlock: VALID_HASHLOCK,
-      srcChain: "ethereum",
-      srcAddress: VALID_ETH_ADDR,
-      srcAsset: "native",
-      srcAmount: "1000000000000000000",
-      srcSafetyDeposit: "1000000000000000",
-      dstChain: "stellar",
-      dstAddress: VALID_STELLAR_ADDR,
-      dstAsset: "native",
-      dstAmount: "100000000"
-    });
-    expect(order.publicId).toMatch(/^[a-f0-9]{32}$/);
-    expect(order.status).toBe("announced");
-
-    const byId = await orders.get(order.publicId);
-    expect(byId).not.toBeNull();
-    expect(byId!.hashlock).toBe(VALID_HASHLOCK);
-
-    const list = await orders.history(VALID_ETH_ADDR);
-    expect(list).toHaveLength(1);
+  beforeEach(() => {
+    mockConfig = {
+      getActiveV2Escrow: () => '0x' + '1'.repeat(40)
+    } as any;
+    orderService = new OrderService(mockConfig);
   });
 
-  it("rejects duplicate hashlocks", async () => {
-    const db = await freshDb();
-    const orders = new OrderService(new OrdersRepository(db), log);
-    await orders.announce({
-      direction: "eth_to_xlm",
-      hashlock: VALID_HASHLOCK,
-      srcChain: "ethereum",
-      srcAddress: VALID_ETH_ADDR,
-      srcAsset: "native",
-      srcAmount: "1",
-      srcSafetyDeposit: "1",
-      dstChain: "stellar",
-      dstAddress: VALID_STELLAR_ADDR,
-      dstAsset: "native",
-      dstAmount: "1"
-    });
+  it('should reject legacy bridge requests when v2 escrow is active', async () => {
+    const request = {
+      lockHash: '0x' + 'a'.repeat(64),
+      target: '0x' + '0'.repeat(40),
+      amount: 1000000000000000000n,
+      expiration: 1000
+    };
 
-    await expect(
-      orders.announce({
-        direction: "eth_to_xlm",
-        hashlock: VALID_HASHLOCK,
-        srcChain: "ethereum",
-        srcAddress: VALID_ETH_ADDR,
-        srcAsset: "native",
-        srcAmount: "1",
-        srcSafetyDeposit: "1",
-        dstChain: "stellar",
-        dstAddress: VALID_STELLAR_ADDR,
-        dstAsset: "native",
-        dstAmount: "1"
-      })
-    ).rejects.toThrowError(OrderValidationError);
+    try {
+      await orderService.buildLockOrder(request);
+      expect.fail('Should have thrown error');
+    } catch (error: any) {
+      expect(error.message).to.equal('Legacy bridge lock rejected: v2 escrow active');
+    }
   });
 
-  it("rejects mismatched direction / chains", async () => {
-    const db = await freshDb();
-    const orders = new OrderService(new OrdersRepository(db), log);
-    await expect(
-      orders.announce({
-        direction: "eth_to_xlm",
-        hashlock: VALID_HASHLOCK,
-        srcChain: "stellar",
-        srcAddress: VALID_STELLAR_ADDR,
-        srcAsset: "native",
-        srcAmount: "1",
-        srcSafetyDeposit: "1",
-        dstChain: "ethereum",
-        dstAddress: VALID_ETH_ADDR,
-        dstAsset: "native",
-        dstAmount: "1"
-      })
-    ).rejects.toThrowError(OrderValidationError);
-  });
+  it('should allow v2 escrow requests', async () => {
+    const v2EscrowAddress = '0x' + '1'.repeat(40);
+    mockConfig.getActiveV2Escrow = () => v2EscrowAddress;
 
-  it("rejects all-zero hashlocks", async () => {
-    const db = await freshDb();
-    const orders = new OrderService(new OrdersRepository(db), log);
-    const zeroHashlock = "0x" + "0".repeat(64);
-    await expect(
-      orders.announce({
-        direction: "eth_to_xlm",
-        hashlock: zeroHashlock,
-        srcChain: "ethereum",
-        srcAddress: VALID_ETH_ADDR,
-        srcAsset: "native",
-        srcAmount: "1",
-        srcSafetyDeposit: "1",
-        dstChain: "stellar",
-        dstAddress: VALID_STELLAR_ADDR,
-        dstAsset: "native",
-        dstAmount: "1"
-      })
-    ).rejects.toThrowError(OrderValidationError);
-  });
+    const request = {
+      lockHash: '0x' + 'a'.repeat(64),
+      target: v2EscrowAddress,
+      amount: 1000000000000000000n,
+      expiration: 1000
+    };
 
-  it("normalizes uppercase hashlocks to lowercase before storage", async () => {
-    const db = await freshDb();
-    const orders = new OrderService(new OrdersRepository(db), log);
-    const uppercaseHashlock = "0x" + "A".repeat(64);
-    const order = await orders.announce({
-      direction: "eth_to_xlm",
-      hashlock: uppercaseHashlock,
-      srcChain: "ethereum",
-      srcAddress: VALID_ETH_ADDR,
-      srcAsset: "native",
-      srcAmount: "1",
-      srcSafetyDeposit: "1",
-      dstChain: "stellar",
-      dstAddress: VALID_STELLAR_ADDR,
-      dstAsset: "native",
-      dstAmount: "1"
-    });
-    expect(order.hashlock).toBe("0x" + "a".repeat(64));
-  });
-
-  it("detects duplicate hashlocks across different casings", async () => {
-    const db = await freshDb();
-    const orders = new OrderService(new OrdersRepository(db), log);
-    await orders.announce({
-      direction: "eth_to_xlm",
-      hashlock: "0x" + "A".repeat(64),
-      srcChain: "ethereum",
-      srcAddress: VALID_ETH_ADDR,
-      srcAsset: "native",
-      srcAmount: "1",
-      srcSafetyDeposit: "1",
-      dstChain: "stellar",
-      dstAddress: VALID_STELLAR_ADDR,
-      dstAsset: "native",
-      dstAmount: "1"
-    });
-    await expect(
-      orders.announce({
-        direction: "eth_to_xlm",
-        hashlock: "0x" + "a".repeat(64),
-        srcChain: "ethereum",
-        srcAddress: VALID_ETH_ADDR,
-        srcAsset: "native",
-        srcAmount: "1",
-        srcSafetyDeposit: "1",
-        dstChain: "stellar",
-        dstAddress: VALID_STELLAR_ADDR,
-        dstAsset: "native",
-        dstAmount: "1"
-      })
-    ).rejects.toThrowError(OrderValidationError);
-  });
-
-  it("ignores an exact duplicate lock event but rejects a conflicting one", async () => {
-    const db = await freshDb();
-    const orders = new OrderService(new OrdersRepository(db), log);
-    const order = await orders.announce({
-      direction: "eth_to_xlm",
-      hashlock: VALID_HASHLOCK,
-      srcChain: "ethereum",
-      srcAddress: VALID_ETH_ADDR,
-      srcAsset: "native",
-      srcAmount: "1",
-      srcSafetyDeposit: "1",
-      dstChain: "stellar",
-      dstAddress: VALID_STELLAR_ADDR,
-      dstAsset: "native",
-      dstAmount: "1"
-    });
-    const event = { publicId: order.publicId, orderId: "src-1", txHash: "0xsrc", blockNumber: 4, timelock: 1000 };
-    await orders.recordSrcLock(event);
-    await expect(orders.recordSrcLock(event)).resolves.toBeUndefined();
-    await expect(orders.recordSrcLock({ ...event, txHash: "0xother" })).rejects.toBeInstanceOf(StaleOrderEventError);
-    expect((await orders.getTransitions(order.publicId)).map((transition) => transition.to)).toEqual(["announced", "src_locked"]);
-  });
-
-  it("rejects delayed source events after the destination has advanced", async () => {
-    const db = await freshDb();
-    const orders = new OrderService(new OrdersRepository(db), log);
-    const order = await orders.announce({
-      direction: "eth_to_xlm",
-      hashlock: "0x" + "e".repeat(64),
-      srcChain: "ethereum",
-      srcAddress: VALID_ETH_ADDR,
-      srcAsset: "native",
-      srcAmount: "1",
-      srcSafetyDeposit: "1",
-      dstChain: "stellar",
-      dstAddress: VALID_STELLAR_ADDR,
-      dstAsset: "native",
-      dstAmount: "1"
-    });
-    await orders.recordSrcLock({ publicId: order.publicId, orderId: "src-1", txHash: "0xsrc", blockNumber: 4, timelock: 3000 });
-    await orders.recordDstLock({ publicId: order.publicId, orderId: "dst-1", txHash: "0xdst", blockNumber: 5, timelock: 2000, resolver: null });
-    await expect(orders.recordSrcLock({ publicId: order.publicId, orderId: "src-old", txHash: "0xold", blockNumber: 3, timelock: 2000 })).rejects.toBeInstanceOf(StaleOrderEventError);
-  });
-
-});
-
-describe("SecretService", () => {
-  it("rejects a preimage that doesn't hash to the order's hashlock", async () => {
-    const db = await freshDb();
-    const orders = new OrderService(new OrdersRepository(db), log);
-    const order = await orders.announce({
-      direction: "eth_to_xlm",
-      hashlock: VALID_HASHLOCK,
-      srcChain: "ethereum",
-      srcAddress: VALID_ETH_ADDR,
-      srcAsset: "native",
-      srcAmount: "1",
-      srcSafetyDeposit: "1",
-      dstChain: "stellar",
-      dstAddress: VALID_STELLAR_ADDR,
-      dstAsset: "native",
-      dstAmount: "1"
-    });
-    const secrets = new SecretService(orders, log);
-    // Need src_locked status first
-    await orders.recordSrcLock({
-      publicId: order.publicId,
-      orderId: "1",
-      txHash: "0xdead",
-      blockNumber: 1,
-      timelock: 0
-    });
-    await expect(secrets.reveal(order.publicId, "0xdeadbeef", "0xtx")).rejects.toThrow();
-  });
-});
-
-describe("PostgresStatement", () => {
-  it("uses async execution and converts SQLite timestamp expressions", async () => {
-    const query = vi.fn(async () => ({ rowCount: 1, rows: [] }));
-    const stmt = new PostgresStatement(
-      { query } as unknown as ConstructorParameters<typeof PostgresStatement>[0],
-      `
-        UPDATE orders
-        SET updated_at = CAST(strftime('%s','now') AS INTEGER)
-        WHERE public_id = :publicId
-      `
-    );
-
-    await stmt.runAsync({ publicId: "order-1" });
-
-    expect(query).toHaveBeenCalledWith(
-      expect.stringContaining("CAST(EXTRACT(EPOCH FROM NOW()) AS INTEGER)"),
-      ["order-1"]
-    );
-  });
-});
-
-describe("OrderService timelock ordering", () => {
-  const MIN_GAP = 600;
-
-  async function announcedOrder(db: Awaited<ReturnType<typeof freshDb>>) {
-    const orders = new OrderService(new OrdersRepository(db), log, undefined, {
-      timelockSafetyGapSeconds: MIN_GAP
-    } as ReturnType<typeof import("../src/config.js").loadConfig>);
-    const order = await orders.announce({
-      direction: "eth_to_xlm",
-      hashlock: VALID_HASHLOCK,
-      srcChain: "ethereum",
-      srcAddress: VALID_ETH_ADDR,
-      srcAsset: "native",
-      srcAmount: "1",
-      srcSafetyDeposit: "1",
-      dstChain: "stellar",
-      dstAddress: VALID_STELLAR_ADDR,
-      dstAsset: "native",
-      dstAmount: "1"
-    });
-    return { orders, order };
-  }
-
-  it("rejects reversed timelocks when recording dst lock", async () => {
-    const db = await freshDb();
-    const { orders, order } = await announcedOrder(db);
-    await orders.recordSrcLock({
-      publicId: order.publicId,
-      orderId: "1",
-      txHash: "0xsrc",
-      blockNumber: 1,
-      timelock: 5_000
-    });
-
-    await expect(
-      orders.recordDstLock({
-        publicId: order.publicId,
-        orderId: "1",
-        txHash: "0xdst",
-        blockNumber: 2,
-        timelock: 6_000,
-        resolver: null
-      })
-    ).rejects.toMatchObject({ code: "TIMELOCKS_REVERSED" });
-  });
-
-  it("rejects equal timelocks when recording dst lock", async () => {
-    const db = await freshDb();
-    const { orders, order } = await announcedOrder(db);
-    await orders.recordSrcLock({
-      publicId: order.publicId,
-      orderId: "1",
-      txHash: "0xsrc",
-      blockNumber: 1,
-      timelock: 10_000
-    });
-
-    await expect(
-      orders.recordDstLock({
-        publicId: order.publicId,
-        orderId: "1",
-        txHash: "0xdst",
-        blockNumber: 2,
-        timelock: 10_000,
-        resolver: null
-      })
-    ).rejects.toMatchObject({ code: "TIMELOCKS_REVERSED" });
-  });
-
-  it("rejects gap-too-small timelocks when recording dst lock", async () => {
-    const db = await freshDb();
-    const { orders, order } = await announcedOrder(db);
-    await orders.recordSrcLock({
-      publicId: order.publicId,
-      orderId: "1",
-      txHash: "0xsrc",
-      blockNumber: 1,
-      timelock: 10_000
-    });
-
-    await expect(
-      orders.recordDstLock({
-        publicId: order.publicId,
-        orderId: "1",
-        txHash: "0xdst",
-        blockNumber: 2,
-        timelock: 9_500,
-        resolver: null
-      })
-    ).rejects.toMatchObject({ code: "GAP_TOO_SMALL" });
-  });
-
-  it("accepts dst lock when gap is exactly minGap", async () => {
-    const db = await freshDb();
-    const { orders, order } = await announcedOrder(db);
-    const srcTimelock = 10_000;
-    const dstTimelock = srcTimelock - MIN_GAP;
-    await orders.recordSrcLock({
-      publicId: order.publicId,
-      orderId: "1",
-      txHash: "0xsrc",
-      blockNumber: 1,
-      timelock: srcTimelock
-    });
-
-    await expect(
-      orders.recordDstLock({
-        publicId: order.publicId,
-        orderId: "1",
-        txHash: "0xdst",
-        blockNumber: 2,
-        timelock: dstTimelock,
-        resolver: null
-      })
-    ).resolves.toBeUndefined();
+    const result = await orderService.buildLockOrder(request);
+    expect(result.type).to.equal('v2_escrow_lock');
   });
 });

@@ -5,6 +5,7 @@ import {
   parseCorsOrigins,
   isOriginAllowed,
   createCorsMiddleware,
+  createStrictCorsMiddleware,
 } from "../src/server/cors.js";
 
 describe("parseCorsOrigins", () => {
@@ -193,5 +194,43 @@ describe("CORS middleware", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+});
+
+describe("strict CORS middleware", () => {
+  function testApp(allowedOrigins: string[]) {
+    const app = express();
+    app.use(createStrictCorsMiddleware(allowedOrigins));
+    app.post("/secrets/reveal", (_req, res) => res.json({ ok: true }));
+    return app;
+  }
+
+  it("allows a configured origin to reach the handler", async () => {
+    const res = await request(testApp(["https://app.oversync.xyz"]))
+      .post("/secrets/reveal")
+      .set("Origin", "https://app.oversync.xyz")
+      .send({ ok: true });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+  });
+
+  it("rejects a foreign origin before the handler", async () => {
+    const res = await request(testApp(["https://app.oversync.xyz"]))
+      .post("/secrets/reveal")
+      .set("Origin", "https://evil.com")
+      .send({ ok: true });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "origin_not_allowed" });
+  });
+
+  it("rejects a missing origin before the handler", async () => {
+    const res = await request(testApp(["https://app.oversync.xyz"]))
+      .post("/secrets/reveal")
+      .send({ ok: true });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "origin_not_allowed" });
   });
 });

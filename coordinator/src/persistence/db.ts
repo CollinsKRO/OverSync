@@ -170,7 +170,8 @@ async function openPostgresDatabase(url: string): Promise<PostgresDatabase> {
   const migrationsDir = resolve(__dirname, "..", "..", "migrations");
   const migrationFiles = [
     // Add migrations in order. For now, just the initial migration.
-    "001_initial.sql"
+    "001_initial.sql",
+    "002_chain_cursors.sql"
   ];
 
   for (const file of migrationFiles) {

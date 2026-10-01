@@ -1,6 +1,10 @@
 const { ethers } = require("hardhat");
 
 async function main() {
+  const registryAddress = process.env.RESOLVER_REGISTRY_ADDRESS;
+  if (!registryAddress || !ethers.isAddress(registryAddress) || registryAddress === ethers.ZeroAddress) {
+    throw new Error("Set RESOLVER_REGISTRY_ADDRESS to the deployed resolver registry");
+  }
   console.log("🚀 Manual MainnetHTLC Deploy (workaround)...");
 
   // Get deployer
@@ -23,7 +27,7 @@ async function main() {
     console.log("📦 Starting deployment...");
     
     // Deploy WITHOUT waiting
-    const deployTx = await MainnetHTLC.deploy();
+    const deployTx = await MainnetHTLC.deploy(registryAddress);
     const txHash = deployTx.deploymentTransaction().hash;
     
     console.log("✅ Deployment transaction sent!");
