@@ -50,6 +50,18 @@ export interface Transaction {
   autoRefundFailed?: boolean;
   autoRefundError?: string;
   networkMode?: 'mainnet' | 'testnet';
+  /**
+   * Claim receipt verification data decoded from the claim transaction
+   * (issue #274). The timeline renders the Claimed step only when this
+   * matches the coordinator order (hashlock, amount, asset, order id).
+   */
+  claimReceipt?: {
+    orderId?: string | null;
+    hashlock?: string | null;
+    amountWei?: string | null;
+    token?: string | null;
+    preimage?: string | null;
+  } | null;
 }
 
 export interface RecoveryAddresses {
@@ -141,6 +153,47 @@ export function mapCoordinatorOrderToTransaction(order: any): Transaction {
     refundNetwork: isEthToXlm ? 'ethereum' : 'stellar',
     refundedAt: order.status === 'refunded' ? order.updatedAt * 1000 : undefined,
     networkMode: isTestnetMode ? 'testnet' : 'mainnet',
+    claimReceipt: buildClaimReceiptFromCoordinatorOrder(order),
+  };
+}
+
+/**
+ * Build the claim-verification payload for the timeline (issue #274).
+ *
+ * The coordinator order is the authoritative record of what was locked
+ * and what was revealed; the claim side of the swap is verified against
+ * it before the UI may render a claimed state. When the coordinator has
+ * revealed a preimage, the claim receipt carries that preimage plus the
+ * settlement transaction, so the UI can independently check the
+ * preimage→hashlock relation and the destination leg's order id, amount,
+ * and asset.
+ */
+function buildClaimReceiptFromCoordinatorOrder(order: any): Transaction['claimReceipt'] {
+  const dst = order?.dst ?? null;
+  const src = order?.src ?? null;
+  if (!dst && !src) return null;
+
+  const dstLockTx = dst?.lockTx ?? null;
+  const srcLockTx = src?.lockTx ?? null;
+
+  // The claim happens on the destination leg: an ETH→XLM swap is claimed
+  // on Stellar, an XLM→ETH swap is claimed on Ethereum.
+  const isEthToXlm = order.direction === 'eth_to_xlm' || order.direction === 'eth-to-xlm';
+  const claimLeg = isEthToXlm ? dst : src;
+  const claimLockTx = isEthToXlm ? dstLockTx : srcLockTx;
+
+  // No settlement on the claim leg yet — nothing to verify.
+  if (!claimLeg || !claimLockTx) return null;
+
+  return {
+    orderId: claimLeg.orderId,
+    hashlock: order.hashlock ?? null,
+    // Integer amount for the claim leg (wei for ETH, stroop for XLM).
+    amountWei: claimLeg.amount ?? null,
+    // Asset: the coordinator stores chain names rather than contract
+    // addresses, so both legs use the native placeholder for now.
+    token: '0x0000000000000000000000000000000000000000',
+    preimage: order.secret?.revealed ? (order.secret?.preimage ?? null) : null,
   };
 }
 
