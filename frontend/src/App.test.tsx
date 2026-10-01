@@ -7,6 +7,36 @@ vi.mock('./config/networks', () => ({
   isMainnetEnabled: vi.fn(() => false),
   isTestnet: vi.fn(() => true),
   resolveNetworkMode: vi.fn((requested: string) => requested),
+  getCurrentNetwork: vi.fn(() => ({
+    ethereum: {
+      id: 11155111,
+      name: 'sepolia',
+      displayName: 'Sepolia Testnet',
+      rpcUrl: 'https://sepolia.example.test',
+      explorerUrl: 'https://sepolia.etherscan.io',
+      nativeCurrency: { name: 'Sepolia Ether', symbol: 'SEP', decimals: 18 },
+      testnet: true,
+    },
+    stellar: {
+      name: 'testnet',
+      displayName: 'Stellar Testnet',
+      horizonUrl: 'https://horizon-testnet.stellar.org',
+      networkPassphrase: 'Test SDF Network ; September 2015',
+      explorerUrl: 'https://testnet.stellarchain.io',
+      testnet: true,
+    },
+  })),
+  getContractAddresses: vi.fn(() => ({
+    ethereum: {
+      htlcBridge: '0x3f344ACDd17a0c4D21096da895152820f595dc8A',
+      escrowFactory: '0x6c3818E074d891F1FBB3A75913e4BDe87BcF1123',
+      testToken: '0xa0b86a33e6417c4fd30ad9d05d6b9b7cd6dd11b',
+    },
+    stellar: {
+      bridgeAccount: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      escrowAccount: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    },
+  })),
 }));
 
 vi.mock('./lib/useNetworkMode', () => ({
@@ -55,6 +85,10 @@ vi.mock('./components/TransactionHistory', () => ({
   default: () => null,
 }));
 
+vi.mock('./components/DeploymentSelfCheck', () => ({
+  default: () => null,
+}));
+
 describe('App — Mainnet safety gates', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -64,7 +98,7 @@ describe('App — Mainnet safety gates', () => {
   describe('mainnet disabled (VITE_MAINNET_ENABLED unset or false)', () => {
     test('shows "Mainnet Coming" badge when mainnet is disabled', () => {
       render(<App />, { wrapper: MemoryRouter });
-      expect(screen.getByText('Mainnet Coming')).toBeInTheDocument();
+      expect(screen.getByText('Mainnet Coming')).toBeInDocument();
       expect(
         screen.getByTitle(/v2 mainnet launches after independent audit/i),
       ).toBeInTheDocument();
@@ -80,21 +114,21 @@ describe('App — Mainnet safety gates', () => {
       render(<App />, { wrapper: MemoryRouter });
       expect(
         screen.queryByText(/0xa7bcb4ea/i),
-      ).not.toBeInTheDocument();
+      ).not.toBeInDocument();
       expect(
         screen.queryByText(
           /0xa7bCb4EAc8964306F9e3764f67Db6A7af6DdF99A/i,
         ),
-      ).not.toBeInTheDocument();
+      ).not.toBeInDocument();
       expect(
         screen.queryByText(/mainnet\.infura\.io/i),
-      ).not.toBeInTheDocument();
+      ).not.toBeInDocument();
       expect(
         screen.queryByText(/ethereum-rpc\.publicnode\.com/i),
-      ).not.toBeInTheDocument();
+      ).not.toBeInDocument();
       expect(
         screen.queryByText(/v1 single-relayer bridge active/i),
-      ).not.toBeInTheDocument();
+      ).not.toBeInDocument();
     });
 
     test('Mode metric tile shows "Testnet" when mainnet is disabled', () => {
@@ -111,7 +145,7 @@ describe('App — Mainnet safety gates', () => {
 
       render(<App />, { wrapper: MemoryRouter });
 
-      expect(screen.queryByText('Mainnet Coming')).not.toBeInTheDocument();
+      expect(screen.queryByText('Mainnet Coming')).not.toBeInDocument();
       const toggle = screen.getByRole('button', { name: 'Testnet' });
       expect(toggle).toBeEnabled();
     });

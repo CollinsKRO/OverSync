@@ -7,7 +7,8 @@ import { httpRequestDuration } from "../metrics.js";
 import { ordersRoutes } from "./routes/orders.js";
 import { secretsRoutes } from "./routes/secrets.js";
 import { quotesRoutes } from "./routes/quotes.js";
-import { createCorsMiddleware } from "./cors.js";
+import { createCorsMiddleware, createStrictCorsMiddleware } from "./cors.js";
+import { createReadinessRateLimiter } from "./readiness-rate-limit.js";
 import type { OrderService } from "../services/order-service.js";
 import type { SecretService } from "../services/secret-service.js";
 import type { QuoteService } from "../services/quote-service.js";
@@ -28,6 +29,7 @@ export function createApp(deps: AppDeps): Express {
   app.use(pinoHttp({ logger: deps.log }));
   app.use(express.json({ limit: maxRequestBodyBytes }));
   app.use(createCorsMiddleware(deps.corsOrigins));
+  app.use(publicResponseRedaction);
 
   // Prometheus HTTP duration instrumentation
   app.use((req, res, next) => {
@@ -44,7 +46,16 @@ export function createApp(deps: AppDeps): Express {
   app.use(healthRoutes({ limit: readinessLimit, windowMs: readinessWindowMs }));
   app.use(metricsRoutes());
   app.use("/api", ordersRoutes(deps.orders));
-  app.use("/api", secretsRoutes(deps.secrets));
+  app.use(
+    "/api",
+    secretsRoutes(deps.secrets, {
+      cors: createStrictCorsMiddleware(deps.corsOrigins),
+      rateLimit: createReadinessRateLimiter({
+        limit: readinessLimit,
+        windowMs: readinessWindowMs
+      })
+    })
+  );
   app.use("/api", quotesRoutes(deps.quotes));
   app.use("/api", orderMetricsRoutes(deps.orders));
   // 413 / 400 handler — catches oversized request bodies and malformed JSON before the generic error handler.

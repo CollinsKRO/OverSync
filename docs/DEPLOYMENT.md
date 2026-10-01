@@ -91,6 +91,23 @@ ETH_HTLC_ESCROW_TESTNET=0x...
 ETH_RESOLVER_REGISTRY_TESTNET=0x...
 ```
 
+The v2 script hashes the compiled **creation bytecode** in the Hardhat
+artifacts and checks both values against the committed
+`contracts/v2-bytecode-hashes.json` before deployment. Recompile with the
+lockfile's dependencies and review any hash change before updating that file.
+The output deployment file records both addresses in `ethereum.contracts`
+and both hashes in `ethereum.bytecodeHashes` in one write.
+
+For mainnet, prepare `deployments.mainnet.json` with both expected addresses
+under `ethereum.contracts.ResolverRegistry` and
+`ethereum.contracts.HTLCEscrow` before running the script. They must be the
+next two contract addresses for the deployer (registry first, escrow second),
+computed from its pending nonce. A missing file, missing address, stale nonce,
+wrong chain ID, or either bytecode hash mismatch aborts before any broadcast.
+Set `V2_DRY_RUN=true` with the same command to print the preflight decision
+without sending transactions or writing the manifest. Keep the deployer nonce
+unchanged between dry run and deployment.
+
 ## 4. Start the coordinator
 
 ```bash

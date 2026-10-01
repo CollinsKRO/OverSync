@@ -10,10 +10,9 @@ import { buildHtlcReceipt } from '../lib/parseHtlcReceipt';
 import type { Address } from 'viem';
 import HtlcTimeline from './HtlcTimeline';
 import {
-  fetchCoordinatorOrders,
   isRealHash,
   isRealTransaction,
-  mergeTransactions,
+  mapCoordinatorOrderToTransaction,
   type Transaction,
 } from '../lib/orderRecovery';
 
@@ -84,20 +83,48 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
     }
   }, []);
 
+  const [cursor, setCursor] = useState<string | undefined>();
+
   const refreshFromCoordinator = useCallback(async () => {
     const local = loadFromStorage();
     if (!ethAddress && !stellarAddress) {
+
+      setTransactions(loadFromStorage());
+      setCursor(undefined);
       setTransactions(local);
       return;
     }
     setIsLoading(true);
     try {
-      const remote = await fetchCoordinatorOrders(API_BASE_URL, { ethAddress, stellarAddress });
-      const merged = mergeTransactions(local, remote);
+      const params = new URLSearchParams();
+      if (ethAddress) params.set('eth', ethAddress);
+      if (stellarAddress) params.set('stellar', stellarAddress);
+      if (cursor) params.set('cursor', cursor);
+      const res = await fetch(`${API_BASE_URL}/api/orders/history?${params.toString()}`);
+      if (!res.ok) throw new Error(`Coordinator returned ${res.status}`);
+      const body = await res.json();
+      const remote: Transaction[] = Array.isArray(body?.transactions)
+        ? body.transactions.map(mapCoordinatorOrderToTransaction).filter(isRealTransaction)
+        : [];
+      const local = loadFromStorage();
+      const byId = new Map<string, Transaction>();
+      for (const tx of local) byId.set(tx.id, tx);
+      for (const tx of remote) byId.set(tx.id, tx);
+      const merged = Array.from(byId.values()).sort((a, b) => b.timestamp - a.timestamp);
+
       localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
       setTransactions(merged);
+      if (body?.pagination?.nextCursor) {
+        setCursor(body.pagination.nextCursor);
+      } else {
+        setCursor(undefined);
+      }
     } catch (err) {
       console.warn('Coordinator history unavailable, falling back to local cache:', err);
+
+      setTransactions(loadFromStorage());
+      setCursor(undefined);
+
       setTransactions(local);
     } finally {
       setIsLoading(false);
@@ -340,6 +367,17 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
         ))}
       </div>
 
+      {cursor && !isLoading && (
+        <button
+          onClick={refreshFromCoordinator}
+          disabled={isLoading}
+          className="button-hover-scale flex items-center justify-center gap-2 rounded-full border border-cyan-200/30 bg-cyan-200/[0.12] px-4 py-2 text-sm font-semibold text-cyan-50 shadow-[0_12px_34px_rgba(0,226,255,0.12)] transition hover:border-cyan-100/45 hover:bg-cyan-200/[0.18] disabled:opacity-60"
+        >
+          <ArrowRight className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
+          Load More
+        </button>
+      )}
+
       <div className="min-h-0 space-y-3 overflow-y-auto overscroll-contain pr-1">
         {filteredTransactions.length === 0 ? (
           <div className="rounded-2xl border border-white/10 bg-white/[0.035] py-12 text-center">
@@ -383,9 +421,9 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                         <ExternalLink className="h-3 w-3 opacity-70" />
                       </a>
                       <CopyableIdentifier
-                        value={getEtherscanUrl(tx.ethTxHash)}
+                        value={tx.ethTxHash}
                         hideDisplay
-                        copyLabel="Etherscan URL"
+                        copyLabel="transaction hash"
                       />
                     </div>
                   )}
@@ -403,9 +441,9 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                         <ExternalLink className="h-3.5 w-3.5 opacity-70" />
                       </a>
                       <CopyableIdentifier
-                        value={getStellarExplorerUrl(tx.stellarTxHash)}
+                        value={tx.stellarTxHash}
                         hideDisplay
-                        copyLabel="Stellar Expert URL"
+                        copyLabel="transaction hash"
                       />
                     </div>
                   )}
@@ -489,9 +527,9 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
                         <span>{getRefundNetworkLabel(tx)}</span>
                       </a>
                       <CopyableIdentifier
-                        value={getRefundExplorerUrl(tx)}
+                        value={tx.refundTxHash}
                         hideDisplay
-                        copyLabel="refund URL"
+                        copyLabel="transaction hash"
                       />
                     </div>
                   )}
@@ -557,6 +595,7 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
       {refundTarget && refundTarget.onChainOrderId && refundTarget.htlcContractAddress && refundTarget.timelockUnixSeconds && ethAddress && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <RefundDialog
+            coordinatorOrderId={refundTarget.id}
             userAddress={ethAddress as Address}
             orderId={refundTarget.onChainOrderId}
             timelockUnixSeconds={refundTarget.timelockUnixSeconds}

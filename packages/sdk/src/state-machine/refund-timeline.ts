@@ -47,7 +47,7 @@ function describeState(
     case "refundable":
       return {
         label: "Refundable",
-        description: `The ${labels.source} timelock has expired. You can refund your original deposit from the ${labels.source} HTLC contract.`,
+        description: `Both chain timelocks have expired. You can refund your original deposit from the ${labels.source} HTLC contract.`,
       };
   }
 }
@@ -56,13 +56,15 @@ export function simulateRefundTimeline(input: RefundTimelineInput): RefundTimeli
   const now = input.nowUnixSeconds ?? Math.floor(Date.now() / 1000);
   const labels = DIRECTION_LABELS[input.direction];
 
-  const srcExpired = now >= input.sourceTimelockUnixSeconds;
-  const dstExpired = now >= input.destinationTimelockUnixSeconds;
+  const srcExpired = now > input.sourceTimelockUnixSeconds;
+  const dstExpired = now > input.destinationTimelockUnixSeconds;
 
   let state: SimulatedState;
-  if (srcExpired) {
+  if (!input.sourceLockObserved || !input.destinationLockObserved) {
+    state = "waiting";
+  } else if (srcExpired && dstExpired) {
     state = "refundable";
-  } else if (input.destinationLockObserved && !dstExpired) {
+  } else if (!dstExpired) {
     state = "claimable";
   } else {
     state = "waiting";
@@ -77,8 +79,8 @@ export function simulateRefundTimeline(input: RefundTimelineInput): RefundTimeli
 
   const refundDesc =
     input.direction === "eth_to_xlm"
-      ? "You can refund ETH on Ethereum (source) after the source timelock expires."
-      : "You can refund XLM on Stellar (source) after the source timelock expires.";
+      ? "You can refund ETH on Ethereum (source) after both chain timelocks expire."
+      : "You can refund XLM on Stellar (source) after both chain timelocks expire.";
 
   return {
     state,

@@ -6,6 +6,11 @@
 
 import { gasPriceTracker } from './gas-tracker.js';
 import { getCurrentTimestamp } from './utils.js';
+import {
+  RelayRefusalError,
+  type RelayAction,
+  type RelaySubmissionTracker,
+} from './relay-submission-tracker.js';
 
 /**
  * Quote request parameters
@@ -61,6 +66,16 @@ export interface QuoteResponse {
   validUntil: number;
 }
 
+interface CoordinatorQuote {
+  fresh: boolean;
+  fromAsset: string;
+  toAsset: string;
+  amount: string;
+  fromNetwork: string;
+  toNetwork: string;
+  expiresAt: number;
+}
+
 /**
  * Token price information
  */
@@ -81,6 +96,80 @@ export class QuoterService {
 
   constructor() {
     this.initializeTokenPrices();
+  }
+
+  /** Re-read the accepted coordinator quote inside the tracked attempt. */
+  async submitIfCoordinatorQuoteMatches<R>(
+    quote: QuoteResponse | undefined,
+    coordinatorQuoteId: string | undefined,
+    action: RelayAction,
+    tracker: RelaySubmissionTracker,
+    executor: () => Promise<R>
+  ) {
+    return tracker.submit(action, async () => {
+      if (!quote || !coordinatorQuoteId) {
+        throw new RelayRefusalError('COORDINATOR_QUOTE_REQUIRED');
+      }
+      const baseUrl = (process.env.COORDINATOR_URL ?? 'http://localhost:3001').replace(/\/+$/, '');
+      let response: Response;
+      try {
+        response = await fetch(
+          `${baseUrl}/api/quotes/${encodeURIComponent(coordinatorQuoteId)}/status`
+        );
+      } catch {
+        throw new RelayRefusalError('COORDINATOR_QUOTE_UNAVAILABLE');
+      }
+      if (response.status === 410) {
+        throw new RelayRefusalError('COORDINATOR_QUOTE_EXPIRED');
+      }
+      if (!response.ok) {
+        throw new RelayRefusalError('COORDINATOR_QUOTE_UNAVAILABLE');
+      }
+
+      let coordinatorQuote: CoordinatorQuote;
+      try {
+        const body: unknown = await response.json();
+        if (!body || typeof body !== 'object') throw new Error('invalid quote response');
+        coordinatorQuote = body as CoordinatorQuote;
+      } catch {
+        throw new RelayRefusalError('COORDINATOR_QUOTE_INVALID');
+      }
+
+      if (
+        typeof coordinatorQuote.fresh !== 'boolean' ||
+        typeof coordinatorQuote.fromAsset !== 'string' ||
+        typeof coordinatorQuote.toAsset !== 'string' ||
+        typeof coordinatorQuote.amount !== 'string' ||
+        typeof coordinatorQuote.fromNetwork !== 'string' ||
+        typeof coordinatorQuote.toNetwork !== 'string' ||
+        typeof coordinatorQuote.expiresAt !== 'number'
+      ) {
+        throw new RelayRefusalError('COORDINATOR_QUOTE_INVALID');
+      }
+
+      const expiryMs = coordinatorQuote.expiresAt < 1_000_000_000_000
+        ? coordinatorQuote.expiresAt * 1000
+        : coordinatorQuote.expiresAt;
+      if (!coordinatorQuote.fresh || !Number.isFinite(expiryMs) || Date.now() > expiryMs) {
+        throw new RelayRefusalError('COORDINATOR_QUOTE_EXPIRED');
+      }
+
+      const localExpiryMs = quote.validUntil < 1_000_000_000_000
+        ? quote.validUntil * 1000
+        : quote.validUntil;
+      const matches =
+        coordinatorQuote.fromAsset?.toLowerCase() === quote.fromToken.toLowerCase() &&
+        coordinatorQuote.toAsset?.toLowerCase() === quote.toToken.toLowerCase() &&
+        coordinatorQuote.amount === quote.fromAmount &&
+        coordinatorQuote.fromNetwork?.toLowerCase() === quote.fromChain.toLowerCase() &&
+        coordinatorQuote.toNetwork?.toLowerCase() === quote.toChain.toLowerCase() &&
+        expiryMs === localExpiryMs;
+      if (!matches) {
+        throw new RelayRefusalError('COORDINATOR_QUOTE_MISMATCH');
+      }
+
+      return executor();
+    });
   }
 
   /**

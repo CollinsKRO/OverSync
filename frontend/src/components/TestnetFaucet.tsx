@@ -2,19 +2,36 @@ import { useState } from 'react';
 import { useToast } from './Toast';
 import { getFaucets, isTestnet } from '../config/networks';
 
+export function walletIsConfiguredTestnet(walletNetwork: string | null | undefined): boolean {
+  return walletNetwork === 'testnet';
+}
+
+/** Rebuilds nothing unless the wallet is still on the configured testnet. */
+export function buildFaucetPayment<T>(walletNetwork: string | null | undefined, build: () => T): T | null {
+  if (!walletIsConfiguredTestnet(walletNetwork)) return null;
+  return build();
+}
+
 interface TestnetFaucetProps {
   ethAddress?: string;
   stellarAddress?: string;
+  walletNetwork?: string;
+  buildPayment?: () => { amount: string };
 }
 
-export default function TestnetFaucet({ ethAddress, stellarAddress }: TestnetFaucetProps) {
+export default function TestnetFaucet({ ethAddress, stellarAddress, walletNetwork, buildPayment }: TestnetFaucetProps) {
   const [isOpen, setIsOpen] = useState(false);
   const toast = useToast();
+  const network = walletNetwork ?? (isTestnet() ? 'testnet' : 'mainnet');
 
-  // Only show faucets on testnet
-  if (!isTestnet()) {
+  if (!walletIsConfiguredTestnet(network)) {
     return null;
   }
+
+  const requestFunding = () => {
+    const current = walletNetwork ?? (isTestnet() ? 'testnet' : 'mainnet');
+    buildFaucetPayment(current, () => buildPayment?.() ?? { amount: '1' });
+  };
 
   const faucetConfig = getFaucets();
   const faucets = [
@@ -50,6 +67,9 @@ export default function TestnetFaucet({ ethAddress, stellarAddress }: TestnetFau
       {isOpen && (
         <div className="absolute right-0 z-[100] mt-2 w-80 rounded-xl border border-cyan-200/20 bg-[#070b1c]/95 p-4 shadow-2xl backdrop-blur-xl">
           <h3 className="text-white font-semibold mb-4">Get Testnet Tokens</h3>
+          <button type="button" onClick={requestFunding} className="mb-3 text-sm text-cyan-100">
+            Request testnet funding
+          </button>
 
           {/* Connected Addresses */}
           {(ethAddress || stellarAddress) && (

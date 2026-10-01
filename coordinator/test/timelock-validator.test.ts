@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateTimelockOrdering } from "../src/utils/timelock-validator.js";
+import { evaluateRefundEligibility, validateTimelockOrdering } from "../src/utils/timelock-validator.js";
 
 describe("validateTimelockOrdering", () => {
   const minGap = 600;
@@ -40,5 +40,35 @@ describe("validateTimelockOrdering", () => {
     const result = validateTimelockOrdering(srcTimelock, dstTimelock, minGap);
     expect(result.isValid).toBe(false);
     expect(result.error).toBe("GAP_TOO_SMALL");
+  });
+});
+
+describe("evaluateRefundEligibility", () => {
+  it("blocks refunds and identifies the locked chain and its earliest refund time", () => {
+    expect(evaluateRefundEligibility({ ethereum: 900, stellar: 1200 }, 1000)).toEqual({
+      eligible: false,
+      lockedSides: [{ chain: "stellar", earliestRefundAt: 1201 }]
+    });
+  });
+
+  it("allows a refund only when both chain timelocks have expired", () => {
+    expect(evaluateRefundEligibility({ ethereum: 900, stellar: 999 }, 1000)).toEqual({
+      eligible: true,
+      lockedSides: []
+    });
+  });
+
+  it("keeps a chain locked at the exact timelock second", () => {
+    expect(evaluateRefundEligibility({ ethereum: 900, stellar: 1000 }, 1000)).toEqual({
+      eligible: false,
+      lockedSides: [{ chain: "stellar", earliestRefundAt: 1001 }]
+    });
+  });
+
+  it("keeps an unrecorded chain timelock ineligible", () => {
+    expect(evaluateRefundEligibility({ ethereum: 900, stellar: null }, 1000)).toEqual({
+      eligible: false,
+      lockedSides: [{ chain: "stellar", earliestRefundAt: null }]
+    });
   });
 });

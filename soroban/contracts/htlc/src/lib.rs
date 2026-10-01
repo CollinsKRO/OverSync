@@ -6,8 +6,8 @@
 //! so that a swap between Ethereum and Stellar enforces the same
 //! atomicity invariants on both chains:
 //!
-//! - A sender locks `amount` of a Stellar asset under a `hashlock`
-//!   (sha256(preimage)) and a `timelock`.
+//! - A sender locks `amount` of a Stellar asset under the shared
+//!   hashlock v1: sha256(uint256 order_id, 32-byte big-endian || preimage).
 //! - Before the `timelock` the `beneficiary` can claim the locked
 //!   amount by revealing the preimage.
 //! - After the `timelock` anyone can call `refund_order` to return the
@@ -113,7 +113,7 @@ pub struct Order {
     /// triggers the terminal state (claim or refund) as an incentive
     /// to keep the network alive.
     pub safety_deposit: i128,
-    /// sha256(preimage).
+    /// sha256(uint256 order id, 32-byte big-endian || preimage).
     pub hashlock: BytesN<32>,
     /// Unix-second timestamp after which `refund_order` becomes valid.
     pub timelock: u64,
@@ -343,8 +343,16 @@ impl HtlcContract {
             panic_with_error!(&env, Error::Expired);
         }
 
-        // Hashlock check: sha256(preimage) MUST equal the stored hash.
-        let computed = env.crypto().sha256(&preimage);
+        if preimage.len() == 0 {
+            panic_with_error!(&env, Error::InvalidPreimage);
+        }
+
+        // Hashlock v1: SHA256(uint256 orderId, big-endian || preimage bytes).
+        let mut encoded_order_id = [0u8; 32];
+        encoded_order_id[24..].copy_from_slice(&order_id.to_be_bytes());
+        let mut hash_input = Bytes::from_array(&env, &encoded_order_id);
+        hash_input.append(&preimage);
+        let computed = env.crypto().sha256(&hash_input);
         if BytesN::<32>::from(computed) != order.hashlock {
             panic_with_error!(&env, Error::InvalidPreimage);
         }

@@ -46,3 +46,5 @@ export async function makeEthereumHTLCClient(userAddress: Address): Promise<Ethe
 export function getEthereumHtlcAddress(): Address | null {
   return htlcAddress();
 }
+
+export { buildBridgeCall, type BridgeOrderContext, type BridgeSdkContext } from "./bridge-call";

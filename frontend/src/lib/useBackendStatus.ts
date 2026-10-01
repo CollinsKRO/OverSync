@@ -21,17 +21,21 @@ export function useBackendStatus(): BackendStatusState {
   const [lastChecked, setLastChecked] = useState<Date | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef<number>(0);
 
   const check = useCallback(async () => {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    const requestId = ++requestIdRef;
     const timerId = window.setTimeout(() => controller.abort(), TIMEOUT_MS);
 
     setStatus('checking');
 
     try {
       const res = await fetch(`${getApiBase()}/health`, { signal: controller.signal });
+
+      if (requestId !== requestIdRef.current) return;
 
       setLastChecked(new Date());
 
@@ -42,6 +46,9 @@ export function useBackendStatus(): BackendStatusState {
       }
 
       const body: unknown = await res.json().catch(() => null);
+
+      if (requestId !== requestIdRef.current) return;
+
       const isOk = typeof body === 'object' && body !== null && (body as Record<string, unknown>).status === 'ok';
 
       if (isOk) {
@@ -52,6 +59,7 @@ export function useBackendStatus(): BackendStatusState {
         setErrorMessage('Coordinator returned an unexpected status');
       }
     } catch (err: unknown) {
+      if (requestId !== requestIdRef.current) return;
       setLastChecked(new Date());
       const isTimeout = err instanceof Error && err.name === 'AbortError';
       setStatus('unavailable');

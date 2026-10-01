@@ -1,7 +1,12 @@
-import { render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 import AuditGateTimeline, {
   AUDIT_GATES,
+  COORDINATOR_STATUS_TO_STEP,
+  OrderStatusTimeline,
+  initialOrderTimeline,
+  orderTimelineReducer,
   type AuditGate,
   type GateStatus,
 } from './AuditGateTimeline';
@@ -208,5 +213,85 @@ describe('AUDIT_GATES (ROADMAP-derived static data)', () => {
   test('multisig-governance gate stays at planned with no fabricated completion', () => {
     const ms = AUDIT_GATES.find((g) => g.id === 'multisig-governance');
     expect(ms?.status).toBe('planned');
+  });
+});
+
+describe('OrderStatusTimeline — advances only from coordinator order status', () => {
+  const stepStatus = (id: string) => screen.getByTestId(`order-step-${id}`).getAttribute('data-status');
+
+  test('a coordinator claim status marks only the claim step complete', async () => {
+    const fetchOrder = vi.fn(async (id: string) => ({ publicId: id, status: 'completed' }));
+    render(<OrderStatusTimeline orderId="ord-1" fetchOrder={fetchOrder} />);
+
+    await waitFor(() => expect(stepStatus('claim')).toBe('complete'));
+    expect(stepStatus('escrow')).toBe('not_started');
+    expect(stepStatus('secret')).toBe('not_started');
+    expect(fetchOrder).toHaveBeenCalledWith('ord-1');
+  });
+
+  test('a local click without that status does not complete the step', async () => {
+    const fetchOrder = vi.fn(async (id: string) => ({ publicId: id, status: 'announced' }));
+    render(<OrderStatusTimeline orderId="ord-1" fetchOrder={fetchOrder} />);
+    await waitFor(() => expect(fetchOrder).toHaveBeenCalledTimes(1));
+
+    const escrow = screen.getByTestId('order-step-escrow');
+    fireEvent.click(within(escrow).getByRole('button', { name: /I did this/i }));
+
+    await waitFor(() => expect(fetchOrder).toHaveBeenCalledTimes(2));
+    expect(stepStatus('escrow')).toBe('awaiting_coordinator');
+    expect(stepStatus('escrow')).not.toBe('complete');
+  });
+
+  test('the local click completes once the next order response includes the status', async () => {
+    const statuses = ['announced', 'src_locked'];
+    const fetchOrder = vi.fn(async (id: string) => ({ publicId: id, status: statuses.shift() ?? 'src_locked' }));
+    render(<OrderStatusTimeline orderId="ord-1" fetchOrder={fetchOrder} />);
+    await waitFor(() => expect(fetchOrder).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(within(screen.getByTestId('order-step-escrow')).getByRole('button'));
+    await waitFor(() => expect(stepStatus('escrow')).toBe('complete'));
+  });
+
+  test('an older order response does not move the current timeline', async () => {
+    let resolveOld: (v: { publicId: string; status: string }) => void = () => {};
+    const fetchOrder = vi.fn((id: string) =>
+      id === 'ord-old'
+        ? new Promise<{ publicId: string; status: string }>((r) => { resolveOld = r; })
+        : Promise.resolve({ publicId: id, status: 'announced' })
+    );
+    const { rerender } = render(<OrderStatusTimeline orderId="ord-old" fetchOrder={fetchOrder} />);
+    rerender(<OrderStatusTimeline orderId="ord-new" fetchOrder={fetchOrder} />);
+    await waitFor(() => expect(fetchOrder).toHaveBeenCalledWith('ord-new'));
+
+    await act(async () => {
+      resolveOld({ publicId: 'ord-old', status: 'completed' });
+    });
+
+    expect(stepStatus('claim')).toBe('not_started');
+    expect(stepStatus('escrow')).toBe('not_started');
+  });
+
+  test('an unknown status shows an error step instead of the last known success', async () => {
+    const statuses = ['secret_revealed', 'teleported'];
+    const fetchOrder = vi.fn(async (id: string) => ({ publicId: id, status: statuses.shift() ?? 'teleported' }));
+    render(<OrderStatusTimeline orderId="ord-1" fetchOrder={fetchOrder} />);
+    await waitFor(() => expect(stepStatus('secret')).toBe('complete'));
+
+    fireEvent.click(within(screen.getByTestId('order-step-claim')).getByRole('button'));
+    await waitFor(() => expect(screen.getByTestId('order-step-error')).toHaveTextContent(/Unknown coordinator status "teleported"/));
+    expect(stepStatus('secret')).not.toBe('complete');
+  });
+});
+
+describe('orderTimelineReducer', () => {
+  test('maps every coordinator status through the single table', () => {
+    expect(Object.keys(COORDINATOR_STATUS_TO_STEP).sort()).toEqual(
+      ['announced', 'completed', 'dst_locked', 'expired', 'failed', 'refunded', 'secret_revealed', 'src_locked']
+    );
+    let s = orderTimelineReducer(initialOrderTimeline('o'), { type: 'order', orderId: 'o', status: 'dst_locked' });
+    expect(s.completed).toEqual(['escrow']);
+    s = orderTimelineReducer(s, { type: 'order', orderId: 'o', status: 'refunded' });
+    expect(s.error).toBe('Order refunded');
+    expect(orderTimelineReducer(s, { type: 'order', orderId: 'other', status: 'completed' })).toBe(s);
   });
 });

@@ -139,7 +139,9 @@ export function RefundTimelineSimulator() {
 
   return (
     <div className="rounded-xl border border-white/10 bg-black/20 p-4 font-sans text-sm glass-effect">
+
       {/* Header */}
+
       <div className="mb-4 flex items-center gap-2 border-b border-white/5 pb-2">
         <Shield className="h-4 w-4 text-cyan-400" />
         <h4 className="font-semibold text-white">Refund Timeline Simulator</h4>
@@ -147,8 +149,8 @@ export function RefundTimelineSimulator() {
           Read-only simulation
         </span>
       </div>
-
       {/* Read-only disclaimer */}
+
       <div className="mb-4 flex items-start gap-2 rounded-lg bg-amber-500/5 border border-amber-500/20 px-3 py-2">
         <Info className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
         <p className="text-xs text-amber-300/80">
@@ -156,8 +158,8 @@ export function RefundTimelineSimulator() {
           and does not interact with any blockchain.
         </p>
       </div>
-
       {/* Example selector */}
+
       <div className="mb-4">
         <p className="text-xs text-slate-400 mb-2">Select an example scenario:</p>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
@@ -176,7 +178,6 @@ export function RefundTimelineSimulator() {
           ))}
         </div>
       </div>
-
       {/* Direction badge */}
       <div className="mb-4 flex items-center gap-2">
         <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs font-medium text-white">
@@ -193,7 +194,6 @@ export function RefundTimelineSimulator() {
         {timelockStatus(ex.sourceTimelock, `${srcChain} timelock expiry`, `${srcAsset} refund available`)}
         {timelockStatus(ex.destinationTimelock, `${dstChain} timelock expiry`, `${dstAsset} claim available`)}
       </div>
-
       {/* State */}
       <div className={`mb-4 rounded-lg border ${STATE_STYLES[result.state].border} ${STATE_STYLES[result.state].bg} p-3 flex items-start gap-2`}>
         <StateIcon className={`h-5 w-5 ${STATE_STYLES[result.state].text} mt-0.5 shrink-0`} />
@@ -204,7 +204,6 @@ export function RefundTimelineSimulator() {
           <p className="text-xs text-slate-400 mt-0.5">{result.stateDescription}</p>
         </div>
       </div>
-
       {/* Claim and refund info */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
         <div className="rounded-lg bg-emerald-500/5 border border-emerald-500/20 px-3 py-2">

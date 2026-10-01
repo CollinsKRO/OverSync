@@ -1,15 +1,18 @@
 import { sha256, keccak256, toHex } from "viem";
 
+export type Hex = `0x${string}`;
+
+const MAX_ORDER_ID = (1n << 256n) - 1n;
+
 /**
- * A secret + its two-digest commitments. The Stellar/Soroban HTLC
- * verifies sha256, the Ethereum HTLCEscrow verifies both sha256 AND
- * keccak256. Storing both digests lets cross-chain code pick whichever
- * matches its target chain.
+ * A secret + its two standard digests. Cross-chain escrows use
+ * hashOrderPreimage() to bind SHA-256 to the order id; keccak256 is
+ * retained for unrelated EVM integrations.
  */
 export interface Secret {
   /** 32-byte preimage, hex-encoded with 0x prefix. */
   preimage: `0x${string}`;
-  /** sha256(preimage) — used by Soroban + EVM. */
+  /** sha256(preimage) — unbound digest, not the cross-chain order hashlock. */
   sha256: `0x${string}`;
   /** keccak256(preimage) — convention for vanilla EVM HTLCs. */
   keccak256: `0x${string}`;
@@ -63,6 +66,33 @@ export function hashSecret(preimage: `0x${string}` | Uint8Array): Secret {
     sha256: sha256(toHex(bytes)),
     keccak256: keccak256(toHex(bytes))
   };
+}
+
+/** Hash the order id's 32-byte big-endian encoding followed by the preimage. */
+export function hashOrderPreimage(orderId: bigint, preimage: Hex | Uint8Array): Hex {
+  if (orderId < 0n || orderId > MAX_ORDER_ID) {
+    throw new Error("orderId must fit in an unsigned 256-bit integer");
+  }
+
+  if (typeof preimage === "string") {
+    if (preimage === "0x") throw new Error("preimage must not be empty");
+    if (!/^0x(?:[0-9a-fA-F]{2})+$/.test(preimage)) {
+      throw new Error("preimage must be non-empty, even-length hex bytes");
+    }
+  }
+  const bytes = typeof preimage === "string" ? hexToUint8(preimage) : preimage;
+  if (bytes.length === 0) {
+    throw new Error("preimage must not be empty");
+  }
+
+  const encoded = new Uint8Array(32 + bytes.length);
+  let value = orderId;
+  for (let index = 31; index >= 0; index--) {
+    encoded[index] = Number(value & 0xffn);
+    value >>= 8n;
+  }
+  encoded.set(bytes, 32);
+  return sha256(toHex(encoded));
 }
 
 /**

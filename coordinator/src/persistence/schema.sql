@@ -77,3 +77,26 @@ CREATE TABLE IF NOT EXISTS resolver_heartbeats (
     chain       TEXT NOT NULL CHECK (chain IN ('ethereum', 'stellar')),
     last_seen   INTEGER NOT NULL
 );
+
+-- Last chain position (Ethereum block / Soroban ledger) the coordinator
+-- has fully processed, per chain. `network_id` pins the cursor to a
+-- specific network so a cursor from testnet can never be replayed against
+-- mainnet (startup rejects a mismatch).
+CREATE TABLE IF NOT EXISTS chain_cursors (
+    chain       TEXT    PRIMARY KEY CHECK (chain IN ('ethereum', 'soroban')),
+    network_id  TEXT    NOT NULL,
+    position    INTEGER NOT NULL,
+    cursor      TEXT,
+    updated_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+);
+
+-- Chain events already applied to order state. Redelivered events (after a
+-- restart or a crash between detecting an event and persisting the cursor)
+-- are skipped, so a claim or refund is never applied twice.
+CREATE TABLE IF NOT EXISTS processed_chain_events (
+    event_key   TEXT    PRIMARY KEY,
+    chain       TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,
+    position    INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+);

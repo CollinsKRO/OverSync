@@ -1,16 +1,23 @@
 import { useCallback, useEffect, useState } from 'react';
-import freighterApi from '@stellar/freighter-api';
-import { isMainnetEnabled, isTestnet, resolveNetworkMode } from '../config/networks';
+import rawFreighterApi from '@stellar/freighter-api';
+import {
+  isMainnetEnabled,
+  isTestnet,
+  resolveNetworkMode,
+  STELLAR_MAINNET_PASSPHRASE,
+  STELLAR_TESTNET_PASSPHRASE,
+} from '../config/networks';
 import { resolveViteMainnetRpcUrl, resolveViteSepoliaRpcUrl } from '../config/rpc-urls';
 import { checkNetworkMode, type NetworkModeGuard } from '@oversync/sdk';
 
+const freighterApi = (rawFreighterApi as any)?.default ?? rawFreighterApi;
+
 export type NetworkMode = 'testnet' | 'mainnet';
+
+export { STELLAR_MAINNET_PASSPHRASE, STELLAR_TESTNET_PASSPHRASE };
 
 const ETH_MAINNET_CHAIN_ID_HEX = '0x1';
 const ETH_SEPOLIA_CHAIN_ID_HEX = '0xaa36a7';
-
-const STELLAR_MAINNET_PASSPHRASE = 'Public Global Stellar Network ; September 2015';
-const STELLAR_TESTNET_PASSPHRASE = 'Test SDF Network ; September 2015';
 
 const MAINNET_RPC_URL = resolveViteMainnetRpcUrl();
 
@@ -33,7 +40,7 @@ function normalizeChainId(chainId: string | null): string | null {
   return trimmed.toLowerCase();
 }
 
-function readRequestedModeFromUrl(): NetworkMode {
+export function readRequestedModeFromUrl(): NetworkMode {
   if (typeof window === 'undefined') {
     return 'testnet';
   }
@@ -48,8 +55,87 @@ function expectedEthChainIdHex(mode: NetworkMode): string {
   return mode === 'mainnet' ? ETH_MAINNET_CHAIN_ID_HEX : ETH_SEPOLIA_CHAIN_ID_HEX;
 }
 
-function expectedStellarPassphrase(mode: NetworkMode): string {
+export function expectedStellarPassphrase(mode: NetworkMode): string {
   return mode === 'mainnet' ? STELLAR_MAINNET_PASSPHRASE : STELLAR_TESTNET_PASSPHRASE;
+}
+
+/**
+ * Extract and normalize a Stellar network passphrase from Freighter API responses.
+ * Supports { networkPassphrase }, { network }, and string responses.
+ */
+export function normalizeFreighterPassphrase(info: any): string | null {
+  if (!info) return null;
+  if (typeof info === 'object') {
+    if (typeof info.networkPassphrase === 'string' && info.networkPassphrase.trim()) {
+      return info.networkPassphrase.trim();
+    }
+    if (typeof info.network === 'string') {
+      const net = info.network.trim().toUpperCase();
+      if (net === 'PUBLIC' || net === 'MAINNET') {
+        return STELLAR_MAINNET_PASSPHRASE;
+      }
+      if (net === 'TESTNET') {
+        return STELLAR_TESTNET_PASSPHRASE;
+      }
+      return info.network.trim();
+    }
+  }
+  if (typeof info === 'string') {
+    const trimmed = info.trim();
+    const upper = trimmed.toUpperCase();
+    if (upper === 'PUBLIC' || upper === 'MAINNET') {
+      return STELLAR_MAINNET_PASSPHRASE;
+    }
+    if (upper === 'TESTNET') {
+      return STELLAR_TESTNET_PASSPHRASE;
+    }
+    return trimmed;
+  }
+  return null;
+}
+
+export interface FreighterAgreementResult {
+  matches: boolean;
+  actualPassphrase: string | null;
+  expectedPassphrase: string;
+  reason?: string;
+}
+
+/**
+ * Compare Freighter's network to the order network mode or expected passphrase.
+ */
+export function verifyFreighterNetworkAgreement(
+  freighterInfoOrPassphrase: any,
+  orderNetworkOrPassphrase: NetworkMode | string,
+): FreighterAgreementResult {
+  const expectedPassphrase =
+    orderNetworkOrPassphrase === 'mainnet'
+      ? STELLAR_MAINNET_PASSPHRASE
+      : orderNetworkOrPassphrase === 'testnet'
+        ? STELLAR_TESTNET_PASSPHRASE
+        : orderNetworkOrPassphrase;
+
+  const actualPassphrase = normalizeFreighterPassphrase(freighterInfoOrPassphrase);
+
+  if (!actualPassphrase) {
+    return {
+      matches: false,
+      actualPassphrase: null,
+      expectedPassphrase,
+      reason: 'Freighter network could not be determined',
+    };
+  }
+
+  const matches = actualPassphrase.trim().toLowerCase() === expectedPassphrase.trim().toLowerCase();
+
+  return {
+    matches,
+    actualPassphrase,
+    expectedPassphrase,
+    reason: matches
+      ? undefined
+      : `Freighter network passphrase "${actualPassphrase}" does not match expected order network passphrase "${expectedPassphrase}"`,
+  };
 }
 
 function eqHexChainId(a: string | null, b: string): boolean {
@@ -159,10 +245,9 @@ export function useNetworkMode(opts: {
         setFreighterNetworkPassphrase(null);
         return;
       }
-      const info: any = await freighterApi.getNetwork();
-      const passphrase =
-        (info && typeof info === 'object' && info.networkPassphrase) ||
-        (typeof info === 'string' ? info : null);
+      const info: any =
+        typeof freighterApi.getNetwork === 'function' ? await freighterApi.getNetwork() : null;
+      const passphrase = normalizeFreighterPassphrase(info);
       setFreighterNetworkPassphrase(passphrase || null);
     } catch {
       setFreighterNetworkPassphrase(null);
@@ -202,6 +287,24 @@ export function useNetworkMode(opts: {
     const id = window.setInterval(refreshFreighter, 4000);
     return () => window.clearInterval(id);
   }, [refreshFreighter, freighterConnected]);
+
+  // Re-check after network change events across wallets and app
+  useEffect(() => {
+    const handleNetworkChange = () => {
+      refreshFreighter();
+      refreshMetamask();
+    };
+
+    window.addEventListener('networkChange', handleNetworkChange);
+    window.addEventListener('freighter:networkChange', handleNetworkChange);
+    window.addEventListener('stellar:networkChange', handleNetworkChange);
+
+    return () => {
+      window.removeEventListener('networkChange', handleNetworkChange);
+      window.removeEventListener('freighter:networkChange', handleNetworkChange);
+      window.removeEventListener('stellar:networkChange', handleNetworkChange);
+    };
+  }, [refreshFreighter, refreshMetamask]);
 
   const writeUrlMode = (next: NetworkMode) => {
     if (typeof window === 'undefined') return;
@@ -272,6 +375,9 @@ export function useNetworkMode(opts: {
     }
     await refreshMetamask();
     await refreshFreighter();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('networkChange'));
+    }
     return { ok: true };
   }, [mode, metamaskConnected, refreshMetamask, refreshFreighter]);
 
@@ -298,6 +404,9 @@ export function useNetworkMode(opts: {
       setLocalMode(next);
       await refreshMetamask();
       await refreshFreighter();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('networkChange'));
+      }
       return { ok: true };
     },
     [mode, metamaskConnected, refreshMetamask, refreshFreighter],
@@ -314,8 +423,12 @@ export function useNetworkMode(opts: {
   const metamaskMatches = metamaskConnected
     ? eqHexChainId(metamaskChainId, expectedChain)
     : true;
+  const freighterAgreement = verifyFreighterNetworkAgreement(
+    freighterNetworkPassphrase,
+    expectedPassphrase,
+  );
   const freighterMatches = freighterConnected
-    ? freighterNetworkPassphrase === expectedPassphrase
+    ? freighterAgreement.matches
     : true;
 
   const guard = checkNetworkMode(requestedMode, isMainnetEnabled());

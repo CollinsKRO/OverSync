@@ -139,4 +139,23 @@ describe('NetworkMismatchBanner', () => {
     // Should NOT show switch app to wallet button
     expect(screen.queryByRole('button', { name: /Switch app to wallet/i })).not.toBeInTheDocument();
   });
+
+  test('renders when wallet/app mode does not match order network', () => {
+    const mainnetState = {
+      ...mockNetworkState,
+      mode: 'mainnet' as const,
+      hasAnyMismatch: false,
+    };
+
+    render(
+      <NetworkMismatchBanner
+        networkState={mainnetState}
+        expectedNetwork="testnet"
+      />
+    );
+
+    expect(screen.getByText(/Your wallet network does not match the order network/i)).toBeInTheDocument();
+    expect(screen.getByText(/Order was created for/i)).toBeInTheDocument();
+  });
 });
+

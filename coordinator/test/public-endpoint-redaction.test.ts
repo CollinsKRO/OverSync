@@ -13,11 +13,19 @@
  * Public endpoints still return useful, non-sensitive data.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import request from "supertest";
 import express from "express";
+import pino from "pino";
+import { createApp } from "../src/server/app.js";
+import { registry } from "../src/metrics.js";
 import { healthRoutes } from "../src/server/routes/health.js";
 import { metricsRoutes } from "../src/server/routes/metrics.js";
+import { publicResponseRedaction } from "../src/server/public-response-redaction.js";
+import type { OrderRow } from "../src/persistence/orders-repo.js";
+import type { OrderService } from "../src/services/order-service.js";
+import type { QuoteService } from "../src/services/quote-service.js";
+import type { SecretService } from "../src/services/secret-service.js";
 
 // ── Secret-like fixtures ─────────────────────────────────────────────────────
 
@@ -54,14 +62,74 @@ const SECRETS = {
   /** Bearer authorization token */
   bearer: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.SensitivePayload.Signature",
 };
+const revealPreimage = `0x${"b".repeat(64)}`;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function makeApp() {
   const app = express();
+  app.use(express.json());
+  app.use(publicResponseRedaction);
   app.use(healthRoutes());
   app.use(metricsRoutes());
   return app;
+}
+
+function makeOrderSecretsQuotesApp() {
+  const order = {
+    publicId: "order-1",
+    direction: "eth_to_xlm",
+    status: "announced",
+    hashlock: `0x${"a".repeat(64)}`,
+    srcChain: "ethereum",
+    srcAddress: "0x1111111111111111111111111111111111111111",
+    srcAsset: "native",
+    srcAmount: "1",
+    srcSafetyDeposit: "0",
+    srcOrderId: null,
+    srcLockTx: null,
+    srcLockBlock: null,
+    srcTimelock: null,
+    dstChain: "stellar",
+    dstAddress: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB422",
+    dstAsset: "native",
+    dstAmount: "1",
+    dstOrderId: null,
+    dstLockTx: null,
+    dstLockBlock: null,
+    dstTimelock: null,
+    preimage: SECRETS.preimage,
+    secretRevealedTx: null,
+    resolverAddress: null,
+    createdAt: 1,
+    updatedAt: 1,
+  } as OrderRow;
+  const orders = { get: vi.fn().mockResolvedValue(order) } as unknown as OrderService;
+  const secrets = {
+    reveal: vi.fn().mockRejectedValue(new Error(`upstream rejected ${revealPreimage}; ${SECRETS.bearer}; ${SECRETS.ethRpcUrl}`)),
+    get: vi.fn().mockResolvedValue(revealPreimage),
+  } as unknown as SecretService;
+  const quotes = {
+    quoteEthXlm: vi.fn().mockResolvedValue({
+      quoteId: "quote-1",
+      pair: "ETH/XLM",
+      srcUsd: 1,
+      dstUsd: 2,
+      source: "fixture",
+      issuedAt: 1,
+      expiresAt: Date.now() + 60_000,
+      preimage: SECRETS.preimage,
+    }),
+  } as unknown as QuoteService;
+
+  return createApp({
+    log: pino({ level: "silent" }),
+    corsOrigins: ["*"],
+    maxRequestBodyBytes: 65_536,
+    orders,
+    secrets,
+    quotes,
+  });
 }
 
 function assertNoSecretLeaks(json: string, label: string) {
@@ -258,6 +326,36 @@ describe("Public Endpoints — Redaction", () => {
   // ── /metrics ──────────────────────────────────────────────────────────────
 
   describe("GET /metrics", () => {
+    it("redacts secrets from raw metrics errors", async () => {
+      const metrics = vi.spyOn(registry, "metrics").mockRejectedValue(new Error(`registry failed: ${SECRETS.preimage}`));
+
+      try {
+        const res = await request(makeApp()).get("/metrics").expect(500);
+
+        expect(res.text).not.toContain(SECRETS.preimage);
+        expect(res.text).toContain("[REDACTED]");
+      } finally {
+        metrics.mockRestore();
+      }
+    });
+
+    it("redacts injected secrets and keeps Prometheus text valid", async () => {
+      const fixture = `# HELP coordinator_fixture_total Fixture ${SECRETS.preimage}\n# TYPE coordinator_fixture_total counter\ncoordinator_fixture_total 1\n`;
+      const metrics = vi.spyOn(registry, "metrics").mockResolvedValue(fixture);
+
+      try {
+        const res = await request(makeApp()).get("/metrics").expect(200);
+
+        expect(res.headers["content-type"]).toContain("text/plain");
+        expect(res.text).toContain("# HELP coordinator_fixture_total");
+        expect(res.text).toContain("# TYPE coordinator_fixture_total counter");
+        expect(res.text).toContain("coordinator_fixture_total 1");
+        expect(res.text).not.toContain(SECRETS.preimage);
+      } finally {
+        metrics.mockRestore();
+      }
+    });
+
     it("returns Prometheus text output without leaking any secrets", async () => {
       const app = makeApp();
       const res = await request(app).get("/metrics").expect(200);
@@ -311,6 +409,37 @@ describe("Public Endpoints — Redaction", () => {
           expect(line, `Metric line leaks ${name}`).not.toContain(value);
         }
       }
+    });
+  });
+
+  describe("order, quote, and secret responses", () => {
+    it("omits order and quote preimages", async () => {
+      const app = makeOrderSecretsQuotesApp();
+      const order = await request(app).get("/api/orders/order-1").expect(200);
+      const quote = await request(app).get("/api/quotes/eth-xlm").expect(200);
+
+      expect(JSON.stringify(order.body)).not.toContain(SECRETS.preimage);
+      expect(order.body.secret).toEqual({ revealed: true, revealedTx: null });
+      expect(JSON.stringify(quote.body)).not.toContain(SECRETS.preimage);
+      expect(quote.body).not.toHaveProperty("preimage");
+    });
+
+    it("redacts secret-bearing upstream errors", async () => {
+      const app = makeOrderSecretsQuotesApp();
+      const res = await request(app)
+        .post("/api/secrets/reveal")
+        .send({ publicId: "order-1", preimage: revealPreimage, txHash: "0xabc" })
+        .expect(400);
+
+      assertNoSecretLeaks(JSON.stringify(res.body), "/api/secrets/reveal");
+      expect(res.body.message).toContain("[REDACTED]");
+    });
+
+    it("preserves the documented successful secret lookup response", async () => {
+      const app = makeOrderSecretsQuotesApp();
+      const res = await request(app).get("/api/secrets/order-1").expect(200);
+
+      expect(res.body).toEqual({ publicId: "order-1", preimage: revealPreimage });
     });
   });
 });

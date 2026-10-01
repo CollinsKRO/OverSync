@@ -19,7 +19,7 @@ function generateUUID(): string {
 interface WebSocket {
   readyState: number;
   send(data: string): void;
-  close(): void;
+  close(code?: number, reason?: string): void;
   terminate(): void;
   ping(): void;
   on(event: string, callback: (...args: any[]) => void): void;
@@ -28,6 +28,98 @@ interface WebSocket {
 interface WebSocketServer {
   on(event: string, callback: (...args: any[]) => void): void;
   close(callback?: () => void): void;
+}
+
+// ---------------------------------------------------------------------------
+// Origin policy — mirrors coordinator/src/server/cors.ts
+// ---------------------------------------------------------------------------
+
+/** Same default as the coordinator's `corsOrigins` config. */
+export const DEFAULT_ALLOWED_ORIGINS =
+  'http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173';
+
+/** WebSocket close code for a policy violation (RFC 6455 §7.4.1). */
+export const WS_POLICY_VIOLATION = 1008;
+
+/**
+ * Parse a comma-separated origin allowlist exactly like the coordinator's
+ * `parseCorsOrigins`, so the socket and the HTTP API admit the same set.
+ */
+export function parseAllowedOrigins(raw: string): string[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  const origins = trimmed
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const origin of origins) {
+    if (origin !== '*') {
+      try {
+        new URL(origin);
+      } catch {
+        throw new Error(`Invalid CORS origin: "${origin}".`);
+      }
+    }
+  }
+  return origins;
+}
+
+/** Read the allowlist from the same env vars the coordinator uses. */
+export function allowedOriginsFromEnv(env: NodeJS.ProcessEnv = process.env): string[] {
+  return parseAllowedOrigins(env.COORDINATOR_CORS_ORIGINS ?? env.CORS_ORIGIN ?? DEFAULT_ALLOWED_ORIGINS);
+}
+
+/**
+ * Unlike HTTP CORS (where a missing Origin means a non-browser caller), a
+ * socket that may carry order data is only accepted with an explicit
+ * allowlisted Origin.
+ */
+export function isSocketOriginAllowed(origin: string | undefined, allowedOrigins: string[]): boolean {
+  if (!origin) return false;
+  if (allowedOrigins.includes('*')) return true;
+  return allowedOrigins.includes(origin);
+}
+
+// ---------------------------------------------------------------------------
+// Outbound redaction
+// ---------------------------------------------------------------------------
+
+/** Keys whose values must never leave the relayer on the socket. */
+const REDACTED_KEYS = new Set([
+  'secret',
+  'secrets',
+  'preimage',
+  'preimages',
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'set-cookie'
+]);
+
+/** `scheme://user:pass@host` → `scheme://host` */
+const URL_USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
+
+/**
+ * Deep-copy a value, dropping preimages/secrets and auth headers and
+ * stripping userinfo from any URL string. Order ids, hashes and status
+ * are kept untouched.
+ */
+export function redactOutbound<T>(value: T): T {
+  return redactValue(value, new WeakSet()) as T;
+}
+
+function redactValue(value: unknown, seen: WeakSet<object>): unknown {
+  if (typeof value === 'string') return value.replace(URL_USERINFO, '$1');
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((v) => redactValue(v, seen));
+  const out: Record<string, unknown> = {};
+  for (const [key, v] of Object.entries(value)) {
+    if (REDACTED_KEYS.has(key.toLowerCase())) continue;
+    out[key] = redactValue(v, seen);
+  }
+  return out;
 }
 
 // 1inch Fusion+ compliant event types
@@ -162,10 +254,69 @@ export class FusionWebSocketServer extends EventEmitter {
   private pingInterval: NodeJS.Timeout | null = null;
   private readonly PING_INTERVAL = 30000; // 30 seconds
   private isRunning = false;
+  private readonly allowedOrigins: string[];
 
-  constructor(private port: number = 3002) {
+  constructor(private port: number = 3002, allowedOrigins: string[] = allowedOriginsFromEnv()) {
     super();
     this.httpServer = createServer();
+    this.allowedOrigins = allowedOrigins;
+  }
+
+  /**
+   * Admit a new socket. The connection is closed with 1008 before it is
+   * registered (and therefore before any order message) when the Origin
+   * header is missing or not on the coordinator CORS allowlist.
+   *
+   * Returns the registered client, or `null` when the socket was refused.
+   */
+  handleConnection(
+    socket: WebSocket,
+    request: { headers: Record<string, string | string[] | undefined>; socket?: { remoteAddress?: string } }
+  ): WebSocketClient | null {
+    const rawOrigin = request.headers['origin'];
+    const origin = Array.isArray(rawOrigin) ? undefined : rawOrigin;
+    if (!isSocketOriginAllowed(origin, this.allowedOrigins)) {
+      socket.close(WS_POLICY_VIOLATION, 'origin not allowed');
+      return null;
+    }
+
+    const userAgent = request.headers['user-agent'];
+    const client: WebSocketClient = {
+      id: generateUUID(),
+      socket,
+      subscriptions: new Set(),
+      orderFilters: new Set(),
+      resolverFilters: new Set(),
+      chainFilters: new Set(),
+      lastPing: Date.now(),
+      isAlive: true,
+      metadata: {
+        userAgent: Array.isArray(userAgent) ? userAgent[0] : userAgent,
+        ip: request.socket?.remoteAddress,
+        connectedAt: Date.now()
+      }
+    };
+    this.clients.set(client.id, client);
+
+    socket.on('message', (raw: unknown) => {
+      let message: WebSocketMessage;
+      try {
+        message = JSON.parse(String(raw));
+      } catch {
+        this.sendError(client, -32700, 'Parse error');
+        return;
+      }
+      this.handleClientMessage(client, message);
+    });
+    socket.on('pong', () => {
+      client.isAlive = true;
+      client.lastPing = Date.now();
+    });
+    socket.on('close', () => {
+      this.clients.delete(client.id);
+    });
+
+    return client;
   }
 
   /**
@@ -220,7 +371,7 @@ export class FusionWebSocketServer extends EventEmitter {
   /**
    * Handle client RPC and subscription messages
    */
-  private handleClientMessage(client: WebSocketClient, message: WebSocketMessage): void {
+  handleClientMessage(client: WebSocketClient, message: WebSocketMessage): void {
     const { id, method, params } = message;
 
     if (!method) {
@@ -470,11 +621,13 @@ export class FusionWebSocketServer extends EventEmitter {
   }
 
   /**
-   * Send message to client
+   * Send message to client. Every outbound frame — broadcast, RPC reply,
+   * history replay, or error — goes through here and is redacted, so a
+   * preimage, RPC userinfo, or auth header can never reach a socket.
    */
   private sendMessage(client: WebSocketClient, message: WebSocketMessage): void {
     if (client.socket.readyState === 1) { // 1 = OPEN
-      client.socket.send(JSON.stringify(message));
+      client.socket.send(JSON.stringify(redactOutbound(message)));
     }
   }
 

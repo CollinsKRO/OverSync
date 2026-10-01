@@ -36,7 +36,19 @@ export {
   createMainnetConfig,
   generatePreimageAndHash,
   verifyPreimage,
+  buildEscrowTerms,
+  loadAndVerifyBalance,
 } from './claimable-balance.js';
+
+export type {
+  EscrowTerms,
+  ClaimableBalanceRecord,
+  RecordedBalanceJson,
+  BalanceLoader,
+  LoadedBalanceResult,
+  BalanceMismatchError,
+  BalanceMismatchReason,
+} from './claimable-balance-match.js';
 
 // Configuration constants
 export const STELLAR_CONFIG = {

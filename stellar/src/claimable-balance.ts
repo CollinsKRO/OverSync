@@ -24,6 +24,15 @@ import {
   Memo,
 } from '@stellar/stellar-sdk';
 import { Server } from '@stellar/stellar-sdk/lib/horizon/index.js';
+import {
+  EscrowTerms,
+  BalanceLoader,
+  BalanceMismatchError,
+  LoadedBalanceResult,
+  buildEscrowTerms,
+  loadAndVerifyBalance,
+  normalizeBalanceRecord,
+} from './claimable-balance-match.js';
 
 /**
  * Configuration for Stellar network
@@ -69,6 +78,8 @@ export interface ClaimParams {
   balanceId: string;
   preimage: string; // hex string
   expectedHashLock?: string; // for HTLC verification
+  /** Escrow terms the balance must match before the claim tx is built. Required. */
+  expected: EscrowTerms;
 }
 
 /**
@@ -77,19 +88,54 @@ export interface ClaimParams {
 export interface RefundParams {
   refunderSecretKey: string;
   balanceId: string;
+  /** Escrow terms the balance must match before the refund tx is built. Required. */
+  expected: EscrowTerms;
 }
 
 /**
  * Stellar HTLC Claimable Balance Manager
  * Provides hash-locked time-locked claimable balance functionality
  */
-export class StellarHTLCManager {
+export class StellarHTLCManager implements BalanceLoader {
   private config: StellarConfig;
   private server: Server;
 
   constructor(config: StellarConfig) {
     this.config = config;
     this.server = new Server(config.horizonUrl);
+  }
+
+  /**
+   * Load a claimable balance from Horizon as a raw JSON record.
+   * Injectable seam so tests can replay recorded balance JSON instead of a live Horizon.
+   * @param balanceId Claimable balance ID
+   * @returns Raw balance JSON, or null when Horizon reports the id as unknown
+   */
+  async loadBalanceRecord(balanceId: string): Promise<Record<string, unknown> | null> {
+    try {
+      const response = await this.server
+        .claimableBalances()
+        .claimableBalance(balanceId)
+        .call();
+      return response as unknown as Record<string, unknown>;
+    } catch (error) {
+      const status = (error as { response?: { status?: number } })?.response?.status;
+      if (status === 404) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * Load a claimable balance as a normalized record for escrow matching.
+   * This is the `BalanceLoader` implementation the claim/refund gate calls.
+   * Tests can replace {@link loadBalanceRecord} to replay recorded Horizon JSON.
+   * @param balanceId Claimable balance ID
+   * @returns The normalized balance, or `not_found` when Horizon does not know the id
+   */
+  async loadBalance(balanceId: string): Promise<LoadedBalanceResult> {
+    const raw = await this.loadBalanceRecord(balanceId);
+    if (raw === null) return { status: 'not_found' };
+    return { status: 'found', balance: normalizeBalanceRecord(raw) };
   }
 
   /**
@@ -216,12 +262,22 @@ export class StellarHTLCManager {
   async claimWithPreimage(params: ClaimParams): Promise<string> {
     try {
       console.log(`🔑 Claiming claimable balance: ${params.balanceId}`);
-      console.log(`🔓 Preimage: ${params.preimage}`);
 
       // Validate preimage format
       if (!/^[0-9a-fA-F]{64}$/.test(params.preimage)) {
         throw new Error('Invalid preimage format');
       }
+
+      if (!params.expected) {
+        throw new Error('expected escrow terms are required to claim a balance');
+      }
+
+      // SECURITY: the balance must match the order escrow (asset, amount, claimant)
+      // before any claim transaction is built. A swapped or foreign balance id must
+      // never reach a claimClaimableBalance operation.
+      await loadAndVerifyBalance(params.balanceId, params.expected, this);
+
+      console.log(`✅ Balance matches the order escrow (asset, amount, claimant verified)`);
 
       // CRITICAL: Verify that preimage matches the hashLock (HTLC security!)
       const providedHash = keccak256('0x' + params.preimage);
@@ -254,9 +310,9 @@ export class StellarHTLCManager {
         })
       );
 
-      // Add preimage as memo (for HTLC verification)
-      txBuilder.addMemo(Memo.text(`preimage:${params.preimage}`));
-      
+      // No memo: Stellar caps text memos at 28 bytes, so a 64-char preimage cannot
+      // fit, and the preimage is secret material that must not be broadcast.
+
       txBuilder.setTimeout(TimeoutInfinite);
       
       // Build and sign transaction
@@ -268,11 +324,13 @@ export class StellarHTLCManager {
       const response = await this.server.submitTransaction(transaction);
 
       console.log(`✅ Claimable balance claimed successfully!`);
-      console.log(`🔑 Preimage revealed: ${params.preimage}`);
       console.log(`📝 Transaction hash: ${response.hash}`);
 
       return response.hash;
     } catch (error) {
+      // Escrow mismatches are a security refusal, not a transport failure — keep
+      // the typed error (and its `code`) so callers can branch on it.
+      if (error instanceof BalanceMismatchError) throw error;
       console.error('❌ Failed to claim claimable balance:', error);
       throw new Error(`Claim failed: ${error instanceof Error ? error.message : error}`);
     }
@@ -286,6 +344,14 @@ export class StellarHTLCManager {
   async refundExpired(params: RefundParams): Promise<string> {
     try {
       console.log(`🔄 Refunding expired claimable balance: ${params.balanceId}`);
+
+      if (!params.expected) {
+        throw new Error('expected escrow terms are required to refund a balance');
+      }
+
+      // SECURITY: same escrow match as claims — a refund tx must only be built
+      // against the balance that actually belongs to this order.
+      await loadAndVerifyBalance(params.balanceId, params.expected, this);
 
       // Create keypair from refunder secret
       const refunderKeypair = Keypair.fromSecret(params.refunderSecretKey);
@@ -324,6 +390,7 @@ export class StellarHTLCManager {
 
       return response.hash;
     } catch (error) {
+      if (error instanceof BalanceMismatchError) throw error;
       console.error('❌ Failed to refund claimable balance:', error);
       throw new Error(`Refund failed: ${error instanceof Error ? error.message : error}`);
     }
@@ -568,4 +635,27 @@ export function generatePreimageAndHash(): { preimage: string; hash: string } {
 export function verifyPreimage(preimage: string, expectedHash: string): boolean {
   const computedHash = crypto.createHash('sha256').update(preimage, 'hex').digest('hex');
   return computedHash === expectedHash;
-} 
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// ESCROW MATCHING RE-EXPORTS (see ./claimable-balance-match.ts)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+export {
+  buildEscrowTerms,
+  loadAndVerifyBalance,
+  verifyBalanceMatchesEscrow,
+  normalizeBalanceRecord,
+  canonicalAssetString,
+  BalanceMismatchError,
+} from './claimable-balance-match.js';
+
+export type {
+  EscrowTerms,
+  BalanceLoader,
+  LoadedBalanceResult,
+  ClaimableBalanceRecord,
+  RecordedBalanceJson,
+  BalanceMismatchReason,
+  BalanceMatchNetwork,
+} from './claimable-balance-match.js';

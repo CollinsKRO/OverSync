@@ -5,6 +5,7 @@
  * always produces the same sequence. No RNG state, no side effects.
  */
 import { createHash } from "node:crypto";
+import { hashOrderPreimage } from "@oversync/sdk/secrets";
 
 export type Hex = `0x${string}`;
 export type Direction = "ETH_TO_XLM" | "XLM_TO_ETH";
@@ -15,7 +16,7 @@ export interface PlannedOrder {
   /** Short deterministic hex tag used in logs and reports (not an on-chain ID). */
   orderId: string;
   preimage: Hex;
-  /** sha256(preimage) — the hashlock used by both HTLC implementations. */
+  /** Hashlock v1 for the isolated dry-run order with on-chain ID 1. */
   hashlock: Hex;
   direction: Direction;
   /** Notional ETH amount in wei (informational only in dry-run). */
@@ -53,12 +54,10 @@ export function generateOrders(
     const preimageBytes = deterministicBytes(seed, "preimage", i);
     const preimage: Hex = `0x${preimageBytes.toString("hex")}`;
 
-    // Hashlock: sha256(preimage) — mirrors what both HTLC contracts enforce.
-    const hashlockBytes = createHash("sha256").update(preimageBytes).digest();
-    const hashlock: Hex = `0x${hashlockBytes.toString("hex")}`;
+    const hashlock = hashOrderPreimage(1n, preimage);
 
     // Short order tag for human-readable output (first 8 bytes of the hashlock).
-    const orderId = `0x${hashlockBytes.toString("hex").slice(0, 16)}`;
+    const orderId = `0x${hashlock.slice(2, 18)}`;
 
     // Direction: 50/50 split.
     const direction: Direction =

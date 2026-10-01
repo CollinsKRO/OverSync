@@ -1,17 +1,63 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
+import type { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
 import { time } from "@nomicfoundation/hardhat-network-helpers";
-import { HTLCEscrow, TestERC20 } from "../../typechain-types";
+import { HTLCEscrow, ResolverRegistry, TestERC20 } from "../../typechain-types";
 
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
 const TIMELOCK = 600; // 10 minutes
 const SAFETY_DEPOSIT = ethers.parseEther("0.001");
 const AMOUNT = ethers.parseEther("0.5");
+const MIN_STAKE = ethers.parseEther("100");
 
-async function deployEscrow() {
+async function deployEscrow(registryAddress = ZERO_ADDR) {
   const HTLCEscrow = await ethers.getContractFactory("HTLCEscrow");
   // resolverRegistry = address(0) → permissionless createOrder
-  return (await HTLCEscrow.deploy(ZERO_ADDR, 0)) as unknown as HTLCEscrow;
+  return (await HTLCEscrow.deploy(registryAddress, 0)) as unknown as HTLCEscrow;
+}
+
+async function deployBoundEscrow(registry: any, resolver: any) {
+  const escrow = await deployEscrow(await registry.getAddress());
+  await registry.connect(resolver).register(ethers.parseEther("1"));
+  return escrow;
+}
+
+async function deployRegistry() {
+  const [owner] = await ethers.getSigners();
+  const Token = await ethers.getContractFactory("TestERC20");
+  const token = (await Token.deploy("ResolverStake", "RST", ethers.parseEther("1000000"))) as unknown as TestERC20;
+
+  const Registry = await ethers.getContractFactory("ResolverRegistry");
+  const registry = await Registry.deploy(
+    await token.getAddress(),
+    ethers.parseEther("1"),
+    owner.address,
+    owner.address
+  );
+
+  return { token, registry };
+}
+
+async function registerResolver(registry: any, resolver: any, stake: bigint) {
+  await registry.connect(resolver).register(stake);
+}
+
+async function deployRegistry() {
+  const [owner, beneficiary] = await ethers.getSigners();
+  const Token = await ethers.getContractFactory("TestERC20");
+  const token = (await Token.deploy(
+    "Stake",
+    "STK",
+    ethers.parseEther("1000000")
+  )) as unknown as TestERC20;
+  const Registry = await ethers.getContractFactory("ResolverRegistry");
+  const registry = (await Registry.deploy(
+    await token.getAddress(),
+    MIN_STAKE,
+    beneficiary.address,
+    owner.address
+  )) as unknown as ResolverRegistry;
+  return { token, registry };
 }
 
 async function deployToken() {
@@ -23,6 +69,10 @@ function randomBytes32() {
   return ethers.hexlify(ethers.randomBytes(32));
 }
 
+function orderHashlock(orderId: bigint, preimage: string) {
+  return ethers.sha256(ethers.solidityPacked(["uint256", "bytes"], [orderId, preimage]));
+}
+
 describe("HTLCEscrow v2", () => {
   describe("createOrder", () => {
     it("locks native ETH with correct hashlock/timelock", async () => {
@@ -30,7 +80,7 @@ describe("HTLCEscrow v2", () => {
       const escrow = await deployEscrow();
 
       const preimage = randomBytes32();
-      const hashlock = ethers.sha256(preimage);
+      const hashlock = orderHashlock(1n, preimage);
 
       const tx = await escrow.connect(sender).createOrder(
         beneficiary.address,
@@ -97,7 +147,7 @@ describe("HTLCEscrow v2", () => {
     it("rejects timelock below MIN_TIMELOCK and above MAX_TIMELOCK", async () => {
       const [sender, beneficiary] = await ethers.getSigners();
       const escrow = await deployEscrow();
-      const hashlock = ethers.sha256(randomBytes32());
+      const hashlock = orderHashlock(1n, randomBytes32());
 
       await expect(
         escrow.connect(sender).createOrder(
@@ -129,7 +179,7 @@ describe("HTLCEscrow v2", () => {
     it("rejects msg.value mismatch for native orders", async () => {
       const [sender, beneficiary] = await ethers.getSigners();
       const escrow = await deployEscrow();
-      const hashlock = ethers.sha256(randomBytes32());
+      const hashlock = orderHashlock(1n, randomBytes32());
 
       await expect(
         escrow.connect(sender).createOrder(
@@ -152,7 +202,7 @@ describe("HTLCEscrow v2", () => {
 
       await token.connect(sender).approve(await escrow.getAddress(), AMOUNT);
       const preimage = randomBytes32();
-      const hashlock = ethers.sha256(preimage);
+      const hashlock = orderHashlock(1n, preimage);
 
       await escrow.connect(sender).createOrder(
         beneficiary.address,
@@ -170,9 +220,75 @@ describe("HTLCEscrow v2", () => {
   });
 
   describe("claimOrder", () => {
-    it("pays beneficiary on correct sha256 preimage and pays caller the safety deposit", async () => {
-      const [sender, beneficiary, relayer] = await ethers.getSigners();
+    it("reverts when the escrow is not bound to a resolver registry", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
       const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = orderHashlock(1n, preimage);
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await expect(
+        escrow.connect(sender).claimOrder(1, preimage)
+      ).to.be.revertedWithCustomError(escrow, "ResolverNotAuthorised");
+    });
+
+    it("claims successfully for a registered resolver on the bound registry pair", async () => {
+      const [owner, sender, beneficiary] = await ethers.getSigners();
+      const { token, registry } = await deployRegistry();
+      const stake = ethers.parseEther("1");
+
+      await token.transfer(sender.address, stake);
+      await token.connect(sender).approve(await registry.getAddress(), stake);
+      await registerResolver(registry, sender, stake);
+
+      const escrow = await deployEscrow(await registry.getAddress());
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await expect(
+        escrow.connect(sender).claimOrder(1, preimage)
+      ).to.not.be.reverted;
+    });
+
+    it("pays beneficiary on correct sha256 preimage and pays caller the safety deposit", async () => {
+      const [owner, sender, beneficiary, relayer] = await ethers.getSigners();
+      const token = await deployToken();
+      const Registry = await ethers.getContractFactory("ResolverRegistry");
+      const registry = await Registry.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      const escrow = await deployEscrow(await registry.getAddress());
+      await token.transfer(sender.address, ethers.parseEther("1"));
+      await token.connect(sender).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, sender, ethers.parseEther("1"));
+      await token.transfer(relayer.address, ethers.parseEther("1"));
+      await token.connect(relayer).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, relayer, ethers.parseEther("1"));
+
       const preimage = randomBytes32();
       const hashlock = ethers.sha256(preimage);
 
@@ -203,7 +319,7 @@ describe("HTLCEscrow v2", () => {
       expect(order.status).to.equal(1); // Claimed
     });
 
-    it("also accepts a keccak256 hashlock (EVM convention)", async () => {
+    it("rejects a keccak256-only hashlock", async () => {
       const [sender, beneficiary] = await ethers.getSigners();
       const escrow = await deployEscrow();
       const preimage = randomBytes32();
@@ -220,14 +336,29 @@ describe("HTLCEscrow v2", () => {
         { value: AMOUNT + SAFETY_DEPOSIT }
       );
 
-      await expect(escrow.connect(beneficiary).claimOrder(1, preimage)).to.not.be.reverted;
+      await expect(escrow.connect(beneficiary).claimOrder(1, preimage))
+        .to.be.revertedWithCustomError(escrow, "InvalidPreimage");
     });
 
     it("rejects invalid preimage", async () => {
-      const [sender, beneficiary] = await ethers.getSigners();
-      const escrow = await deployEscrow();
+      const [owner, sender, beneficiary] = await ethers.getSigners();
+      const token = await deployToken();
+      const Registry = await ethers.getContractFactory("ResolverRegistry");
+      const registry = await Registry.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      const escrow = await deployEscrow(await registry.getAddress());
+      await token.transfer(sender.address, ethers.parseEther("1"));
+      await token.connect(sender).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, sender, ethers.parseEther("1"));
+      await token.transfer(beneficiary.address, ethers.parseEther("1"));
+      await token.connect(beneficiary).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, beneficiary, ethers.parseEther("1"));
       const preimage = randomBytes32();
-      const hashlock = ethers.sha256(preimage);
+      const hashlock = orderHashlock(1n, preimage);
 
       await escrow.connect(sender).createOrder(
         beneficiary.address,
@@ -246,11 +377,102 @@ describe("HTLCEscrow v2", () => {
       ).to.be.revertedWithCustomError(escrow, "InvalidPreimage");
     });
 
-    it("rejects claim after expiry", async () => {
+    it("rejects a one-byte change to the preimage", async () => {
       const [sender, beneficiary] = await ethers.getSigners();
       const escrow = await deployEscrow();
       const preimage = randomBytes32();
-      const hashlock = ethers.sha256(preimage);
+      const changed = ethers.getBytes(preimage);
+      changed[changed.length - 1] ^= 1;
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        orderHashlock(1n, preimage),
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, ethers.hexlify(changed))
+      ).to.be.revertedWithCustomError(escrow, "InvalidPreimage");
+    });
+
+    it("rejects an empty preimage", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const hashlock = ethers.sha256(ethers.solidityPacked(["uint256", "bytes"], [1n, "0x"]));
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await expect(
+        escrow.connect(beneficiary).claimOrder(1, "0x")
+      ).to.be.revertedWithCustomError(escrow, "InvalidPreimage");
+    });
+
+    it("rejects a preimage committed to another order", async () => {
+      const [sender, beneficiary] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const firstPreimage = randomBytes32();
+      const secondPreimage = randomBytes32();
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        orderHashlock(1n, firstPreimage),
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        orderHashlock(2n, secondPreimage),
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await expect(
+        escrow.connect(beneficiary).claimOrder(2, firstPreimage)
+      ).to.be.revertedWithCustomError(escrow, "InvalidPreimage");
+      await expect(escrow.connect(beneficiary).claimOrder(2, secondPreimage)).not.to.be.reverted;
+    });
+
+    it("rejects claim after expiry", async () => {
+      const [owner, sender, beneficiary] = await ethers.getSigners();
+      const token = await deployToken();
+      const Registry = await ethers.getContractFactory("ResolverRegistry");
+      const registry = await Registry.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      const escrow = await deployEscrow(await registry.getAddress());
+      await token.transfer(sender.address, ethers.parseEther("1"));
+      await token.connect(sender).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, sender, ethers.parseEther("1"));
+      await token.transfer(beneficiary.address, ethers.parseEther("1"));
+      await token.connect(beneficiary).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, beneficiary, ethers.parseEther("1"));
+      const preimage = randomBytes32();
+      const hashlock = orderHashlock(1n, preimage);
 
       await escrow.connect(sender).createOrder(
         beneficiary.address,
@@ -271,10 +493,24 @@ describe("HTLCEscrow v2", () => {
     });
 
     it("rejects double claim", async () => {
-      const [sender, beneficiary] = await ethers.getSigners();
-      const escrow = await deployEscrow();
+      const [owner, sender, beneficiary] = await ethers.getSigners();
+      const token = await deployToken();
+      const Registry = await ethers.getContractFactory("ResolverRegistry");
+      const registry = await Registry.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      const escrow = await deployEscrow(await registry.getAddress());
+      await token.transfer(sender.address, ethers.parseEther("1"));
+      await token.connect(sender).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, sender, ethers.parseEther("1"));
+      await token.transfer(beneficiary.address, ethers.parseEther("1"));
+      await token.connect(beneficiary).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, beneficiary, ethers.parseEther("1"));
       const preimage = randomBytes32();
-      const hashlock = ethers.sha256(preimage);
+      const hashlock = orderHashlock(1n, preimage);
 
       await escrow.connect(sender).createOrder(
         beneficiary.address,
@@ -292,6 +528,14 @@ describe("HTLCEscrow v2", () => {
         escrow.connect(beneficiary).claimOrder(1, preimage)
       ).to.be.revertedWithCustomError(escrow, "OrderNotClaimable");
     });
+
+    it("rejects claim against an unknown order with OrderNotFound", async () => {
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      await expect(
+        escrow.claimOrder(999, preimage)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotFound");
+    });
   });
 
   describe("refundOrder", () => {
@@ -299,7 +543,7 @@ describe("HTLCEscrow v2", () => {
       const [sender, beneficiary, cleaner] = await ethers.getSigners();
       const escrow = await deployEscrow();
       const preimage = randomBytes32();
-      const hashlock = ethers.sha256(preimage);
+      const hashlock = orderHashlock(1n, preimage);
       const refundAddr = ethers.Wallet.createRandom().address;
 
       await escrow.connect(sender).createOrder(
@@ -337,10 +581,24 @@ describe("HTLCEscrow v2", () => {
     });
 
     it("rejects refund after a successful claim", async () => {
-      const [sender, beneficiary, cleaner] = await ethers.getSigners();
-      const escrow = await deployEscrow();
+      const [owner, sender, beneficiary, cleaner] = await ethers.getSigners();
+      const token = await deployToken();
+      const Registry = await ethers.getContractFactory("ResolverRegistry");
+      const registry = await Registry.deploy(
+        await token.getAddress(),
+        ethers.parseEther("1"),
+        owner.address,
+        owner.address
+      );
+      const escrow = await deployEscrow(await registry.getAddress());
+      await token.transfer(sender.address, ethers.parseEther("1"));
+      await token.connect(sender).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, sender, ethers.parseEther("1"));
+      await token.transfer(beneficiary.address, ethers.parseEther("1"));
+      await token.connect(beneficiary).approve(await registry.getAddress(), ethers.parseEther("1"));
+      await registerResolver(registry, beneficiary, ethers.parseEther("1"));
       const preimage = randomBytes32();
-      const hashlock = ethers.sha256(preimage);
+      const hashlock = orderHashlock(1n, preimage);
 
       await escrow.connect(sender).createOrder(
         beneficiary.address,
@@ -358,6 +616,134 @@ describe("HTLCEscrow v2", () => {
       await expect(
         escrow.connect(cleaner).refundOrder(1)
       ).to.be.revertedWithCustomError(escrow, "OrderNotRefundable");
+    });
+
+    it("rejects a second refund after timeout", async () => {
+      const [sender, beneficiary, cleaner] = await ethers.getSigners();
+      const escrow = await deployEscrow();
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(sender).createOrder(
+        beneficiary.address,
+        sender.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await time.increase(TIMELOCK + 1);
+      await escrow.connect(cleaner).refundOrder(1);
+      await expect(
+        escrow.connect(cleaner).refundOrder(1)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotRefundable");
+    });
+
+    it("rejects refund against an unknown order with OrderNotFound", async () => {
+      const escrow = await deployEscrow();
+      await expect(
+        escrow.refundOrder(999)
+      ).to.be.revertedWithCustomError(escrow, "OrderNotFound");
+    });
+  });
+
+  // Shared authorization matrix with the Soroban `oversync-htlc`.
+  // Every row here has a mirror in soroban/contracts/htlc/src/test.rs
+  // and a simulator parity check in e2e/parity.test.ts.
+  describe("resolver registry gate (parity with Soroban)", () => {
+    async function deployGatedEscrow() {
+      const { token, registry } = await deployRegistry();
+      const HTLCEscrow = await ethers.getContractFactory("HTLCEscrow");
+      const escrow = (await HTLCEscrow.deploy(
+        await registry.getAddress(),
+        0
+      )) as unknown as HTLCEscrow;
+      return { token, registry, escrow };
+    }
+
+    async function registerResolver(
+      token: TestERC20,
+      registry: ResolverRegistry,
+      resolver: HardhatEthersSigner
+    ) {
+      await token.transfer(resolver.address, MIN_STAKE);
+      await token.connect(resolver).approve(await registry.getAddress(), MIN_STAKE);
+      await registry.connect(resolver).register(MIN_STAKE);
+      expect(await registry.isActive(resolver.address)).to.be.true;
+    }
+
+    it("rejects an unregistered resolver trying to create", async () => {
+      const [, , , stranger] = await ethers.getSigners();
+      const { escrow } = await deployGatedEscrow();
+      const hashlock = ethers.sha256(randomBytes32());
+
+      await expect(
+        escrow.connect(stranger).createOrder(
+          stranger.address,
+          stranger.address,
+          ZERO_ADDR,
+          AMOUNT,
+          SAFETY_DEPOSIT,
+          hashlock,
+          TIMELOCK,
+          { value: AMOUNT + SAFETY_DEPOSIT }
+        )
+      ).to.be.revertedWithCustomError(escrow, "ResolverNotAuthorised");
+    });
+
+    it("lets an active resolver create and a stranger claim permissionlessly", async () => {
+      const [, beneficiary, , resolver, stranger] = await ethers.getSigners();
+      const { token, registry, escrow } = await deployGatedEscrow();
+      await registerResolver(token, registry, resolver);
+
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+
+      await escrow.connect(resolver).createOrder(
+        beneficiary.address,
+        resolver.address,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      // `stranger` is not a registered resolver but claim is permissionless.
+      const before = await ethers.provider.getBalance(beneficiary.address);
+      await escrow.connect(stranger).claimOrder(1, preimage);
+      expect(await ethers.provider.getBalance(beneficiary.address)).to.equal(before + AMOUNT);
+      expect((await escrow.getOrder(1)).status).to.equal(1); // Claimed
+    });
+
+    it("lets a non-resolver refund permissionlessly", async () => {
+      const [, beneficiary, , resolver, stranger] = await ethers.getSigners();
+      const { token, registry, escrow } = await deployGatedEscrow();
+      await registerResolver(token, registry, resolver);
+
+      const hashlock = ethers.sha256(randomBytes32());
+      const refundAddr = resolver.address;
+
+      await escrow.connect(resolver).createOrder(
+        beneficiary.address,
+        refundAddr,
+        ZERO_ADDR,
+        AMOUNT,
+        SAFETY_DEPOSIT,
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT + SAFETY_DEPOSIT }
+      );
+
+      await time.increase(TIMELOCK + 1);
+      const before = await ethers.provider.getBalance(refundAddr);
+      await escrow.connect(stranger).refundOrder(1);
+      expect(await ethers.provider.getBalance(refundAddr)).to.equal(before + AMOUNT);
+      expect((await escrow.getOrder(1)).status).to.equal(2); // Refunded
     });
   });
 

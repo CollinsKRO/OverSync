@@ -33,13 +33,10 @@ import {IResolverRegistry} from "./interfaces/IResolverRegistry.sol";
 ///            This enforces off-chain resolver removal on-chain. Refunds
 ///            remain fully permissionless.
 ///
-/// @dev The contract verifies preimages using BOTH sha256 (interop with
-///      Stellar/Soroban which uses sha256) and keccak256 (matching
-///      classic Ethereum HTLC convention). Callers commit to a single
-///      `hashlock` and the preimage is accepted iff *either* digest
-///      matches it. This lets a single Soroban / Ethereum cross-chain
-///      swap use one hashlock end-to-end while keeping the contract
-///      compatible with EVM tooling that expects keccak.
+/// @dev Cross-chain hashlocks use sha256(abi.encodePacked(orderId,
+///      preimage)); the order id is uint256-encoded as 32-byte big-endian.
+///      This matches the Soroban implementation and prevents a preimage
+///      from being replayed against a different order.
 contract HTLCEscrow is IHTLCEscrow, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -178,13 +175,15 @@ contract HTLCEscrow is IHTLCEscrow, ReentrancyGuard {
     /// @inheritdoc IHTLCEscrow
     function claimOrder(uint256 orderId, bytes memory preimage) external nonReentrant {
         Order storage order = _orders[orderId];
-        if (order.status != OrderStatus.Funded) {
-            // Either non-existent or already finalised; both look the same to the caller.
-            // Suppress incorrect-equality: Safe because we check order.amount == 0 to verify the existence of the mapping entry.
-            // slither-disable-next-line incorrect-equality
-            if (order.amount == 0) revert OrderNotFound();
-            revert OrderNotClaimable();
-        }
+        // `amount` is a safe existence sentinel: createOrder rejects zero
+        // amounts, so an unset entry always has amount == 0. Checking it
+        // first keeps an unknown id from being mistaken for a Funded
+        // order (OrderStatus.Funded is the zero value) — the same reason
+        // the Soroban contract panics with OrderNotFound.
+        // Suppress incorrect-equality: Safe because amount == 0 is only true for unset entries.
+        // slither-disable-next-line incorrect-equality
+        if (order.amount == 0) revert OrderNotFound();
+        if (order.status != OrderStatus.Funded) revert OrderNotClaimable();
         if (block.timestamp > order.timelock) revert Expired();
 
         // Registry gate: if a registry is configured, the caller must be
@@ -200,7 +199,7 @@ contract HTLCEscrow is IHTLCEscrow, ReentrancyGuard {
         // counterparty (keccak256) can share the same on-chain hashlock.
         bytes32 sha = sha256(preimage);
         bytes32 kek = keccak256(preimage);
-        if (sha != order.hashlock && kek != order.hashlock) revert InvalidPreimage();
+        if (sha != order.hashlock) revert InvalidPreimage();
 
         order.status = OrderStatus.Claimed;
         order.finalisedAt = uint64(block.timestamp);
@@ -222,12 +221,12 @@ contract HTLCEscrow is IHTLCEscrow, ReentrancyGuard {
     /// @inheritdoc IHTLCEscrow
     function refundOrder(uint256 orderId) external nonReentrant {
         Order storage order = _orders[orderId];
-        if (order.status != OrderStatus.Funded) {
-            // Suppress incorrect-equality: Safe because we check order.amount == 0 to verify the existence of the mapping entry.
-            // slither-disable-next-line incorrect-equality
-            if (order.amount == 0) revert OrderNotFound();
-            revert OrderNotRefundable();
-        }
+        // See claimOrder: `amount == 0` identifies an unset entry so an
+        // unknown id cannot slip through as a no-op refund.
+        // Suppress incorrect-equality: Safe because amount == 0 is only true for unset entries.
+        // slither-disable-next-line incorrect-equality
+        if (order.amount == 0) revert OrderNotFound();
+        if (order.status != OrderStatus.Funded) revert OrderNotRefundable();
         if (block.timestamp <= order.timelock) revert NotExpired();
 
         order.status = OrderStatus.Refunded;
@@ -269,8 +268,7 @@ contract HTLCEscrow is IHTLCEscrow, ReentrancyGuard {
     // ---------------------------------------------------------------
 
     /// @dev Suppress arbitrary-send-eth and low-level-calls: Safe because _payout only transfers native ETH to the validated beneficiary or refundAddress stored in the order structure.
-    // slither-disable-next-line arbitrary-send-eth
-    // slither-disable-next-line low-level-calls
+    // slither-disable-next-line arbitrary-send-eth,low-level-calls
     function _payout(address token, address to, uint256 amount) private {
         if (token == address(0)) {
             // Native ETH transfer.

@@ -15,6 +15,12 @@ import type { EthereumConfig } from "../config.js";
  * on observed events (e.g. claiming on the opposite chain when a
  * preimage is revealed) is the resolver runtime's job and lives outside
  * this listener so it can be tested independently.
+ *
+ * Any plan that would be submitted on Ethereum MUST be re-validated
+ * against the canonical order with `validatePlanForSubmit`
+ * (`resolver/src/planner`) immediately before it is handed to the
+ * submission path. A plan that drifted, or whose timelock expired while
+ * it waited, is rejected and never submitted.
  */
 export class EthereumListener {
   private readonly client: PublicClient;

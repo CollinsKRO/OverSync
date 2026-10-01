@@ -6,6 +6,9 @@ export interface TractionMetric {
 }
 
 export interface TestnetTractionData {
+  /** The network this fixture is valid for. The card is hidden unless the app
+   *  is running in the matching network mode. */
+  network: 'testnet';
   deployedContracts: TractionMetric;
   supportedRoutes: TractionMetric;
   testsByLayer: TractionMetric;
@@ -16,6 +19,7 @@ export interface TestnetTractionData {
 }
 
 export const testnetTraction: TestnetTractionData = {
+  network: 'testnet',
   deployedContracts: {
     label: 'Deployed contracts',
     value: '2',

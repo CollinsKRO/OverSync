@@ -18,6 +18,7 @@ participant, not a privileged operator.
 - Soroban registry: [`soroban/contracts/resolver-registry/src/lib.rs`](../soroban/contracts/resolver-registry/src/lib.rs).
 - Resolver runner: [`resolver/`](../resolver/), Docker image: [`resolver/Dockerfile`](../resolver/Dockerfile), guide: [`docs/RESOLVERS.md`](RESOLVERS.md).
 - The HTLC contracts have **no admin escape hatch** — verified by the test `non-custodial guarantees > contract has no admin escape hatch` in [`contracts/test/v2/HTLCEscrow.test.ts`](../contracts/test/v2/HTLCEscrow.test.ts).
+- New `MainnetHTLC` deployments use the same active-resolver gate at order creation and the same permissionless claim/refund, preimage, and expiry rules as v2. The shared fixture in [`contracts/test/v2/MainnetHTLCParity.test.ts`](../contracts/test/v2/MainnetHTLCParity.test.ts) checks both contracts. This source change does not alter previously deployed v1 bytecode; migration requires a new deployment.
 - Full trust analysis: [`docs/TRUST_MODEL.md`](TRUST_MODEL.md).
 
 ---
@@ -119,6 +120,86 @@ and returned a fake hash). v2 makes refunds **permissionless and direct**:
 
 A user whose swap fails no longer needs us to act on their behalf;
 they recover their own funds via their own wallet.
+
+### 6.1 *"Could the relayer pay a user twice — once as a claim and once as a refund?"*
+
+**Response.** Before this was fixed, the answer was yes, and the
+documentation is being explicit about it rather than claiming the
+property always held.
+
+Three relayer code paths could each move funds for the same order, and
+nothing stopped two of them from running at once:
+
+| Path | Could broadcast | Went through a shared door |
+|---|---|---|
+| `relayer/src/index.ts` request handlers | ETH release, XLM payout, inline refund, manual refund | only the XLM payout, and only against a fingerprint that included the amount |
+| `relayer/src/recovery-service.ts` | simulated refunds (no-ops) | no |
+| `relayer/src/refund-watchdog.ts` | XLM refund | no |
+
+The concrete double-payment path was: the ETH release
+`sendTransaction` was wrapped in a 30 s timeout, and on timeout the
+inline handler submitted an XLM refund. A timeout is not a failure — the
+transaction was frequently already in the mempool, so the user received
+both the ETH and the XLM refund. A duplicate `POST
+/api/orders/xlm-to-eth` had no idempotency guard at all and re-sent the
+ETH. And because submission state was an in-memory `Map`, a redeploy
+forgot every hash the relayer had already broadcast.
+
+All three paths now submit through one door,
+[`relayer/src/relay-submission-tracker.ts`](../relayer/src/relay-submission-tracker.ts),
+which enforces per `(orderId, side, action)`:
+
+- **one slot** — the key is the order id, the side, and the action only.
+  Amount, destination and extra fields are recorded but never keyed on, so
+  a refund recomputed with a slightly different amount cannot fork into a
+  second transaction;
+- **one action per order** — a submission holds an order-level lock, so a
+  refund requested while a claim is unconfirmed is refused outright
+  (`RelayOrderBusyError`, surfaced to clients as HTTP `409`) rather than
+  paid;
+- **hash before broadcast** — the transaction hash is computed locally
+  (Stellar signature-base digest; `keccak256` of the locally signed
+  payload) and persisted with a `pending` status *before* the transaction
+  can reach a node;
+- **retry attaches to the hash** — once a hash exists the executor is
+  never called again; the retry budget polls that hash to a terminal
+  state. An unconfirmed-but-live transaction keeps the record `pending`
+  and the order lock **held**, so no refund can race it;
+- **restart safety** — records are written atomically to a JSON store
+  (`relayer/src/relay-submission-store.ts`, path configurable via
+  `RELAYER_SUBMISSION_STORE_PATH`) on every transition. A redeploy serves a
+  settled hash from cache and polls an unconfirmed one.
+
+A consequence worth stating plainly: when the claim is unconfirmed, the
+refund now fails with `409` instead of succeeding. That is the point —
+the alternative is paying both legs — and the refund is retried by the
+watchdog once the tracker releases the lock.
+
+Verification (no live chain; every network interaction is an injected
+`confirm` closure, and one test replaces `globalThis.fetch` with a
+throwing spy to prove it is never called):
+
+- `relayer/test/relay-submission-tracker.test.ts` — the four acceptance
+  criteria: two overlapping claims produce one hash; a refund is refused
+  while a claim is pending; a confirmed hash is not resubmitted after a
+  restart; no live chain.
+- `relayer/test/refund-watchdog.test.ts` — the watchdog refunds through the
+  tracker, skips an order with a live claim, and produces exactly one
+  refund when two doors race.
+- `relayer/test/recovery-service.test.ts` — recovery submissions take the
+  same order lock, and a deferred recovery stays *pending* (not failed)
+  while the order is busy.
+- `relayer/test/relay-submission-store.test.ts` — atomic write, corrupt-file
+  tolerance, and pruning that can never drop a non-terminal record.
+
+These run in CI (`pnpm --filter @oversync/relayer test`). The invariant
+is also listed in the auditor table in section 10 of
+[`ARCHITECTURE.md`](../ARCHITECTURE.md) ("Security boundaries: what is
+enforced where").
+
+The v2 HTLC path is unaffected: `claimOrder` and `refundOrder` remain
+permissionless, direct, and mutually exclusive at the contract level, so
+these are defence-in-depth controls for the legacy v1 relayer.
 
 ---
 

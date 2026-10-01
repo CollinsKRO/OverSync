@@ -95,6 +95,22 @@ The schema in `coordinator/migrations/` is applied automatically on startup.
 All migrations are idempotent, so it's safe to run the coordinator against
 an existing database.
 
+## Restart safety (cursors and replay)
+
+The coordinator persists the last fully processed Ethereum block and Soroban
+ledger in `chain_cursors`, together with a `network_id` (`ethereum:<chainId>`
+or the Stellar network passphrase). Applied claim/refund events are recorded in
+`processed_chain_events`.
+
+- On startup each listener resumes from its saved cursor. Ethereum re-reads
+  from the saved block (inclusive); already-applied events are skipped, so the
+  last log is never claimed or refunded twice.
+- Order transition first, then the event is marked processed, then the cursor
+  advances. A crash between any two steps only causes redelivery, which is a no-op.
+- A cursor saved for a different network (for example testnet vs mainnet) makes
+  startup fail with `CursorMismatchError` instead of replaying the wrong chain.
+- Tests use fixture events only (`test/chain-events.test.ts`); no live RPC.
+
 ## Tests
 
 ```bash

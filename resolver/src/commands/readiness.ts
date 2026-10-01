@@ -90,7 +90,19 @@ async function pingEvmRpc(network: "testnet" | "mainnet"): Promise<{
   chainId: number | null;
   detail: string;
 }> {
-  const url = resolveEthereumRpcUrl(network);
+  let url: string;
+  try {
+    url = resolveEthereumRpcUrl(network);
+  } catch (err: any) {
+    // Validation errors (credentials, empty host, network mismatch) are
+    // caught here so assessReadiness() always returns a ReadinessResult
+    // rather than propagating an uncaught exception.
+    return {
+      ok: false,
+      chainId: null,
+      detail: `RPC URL validation failed: ${err?.message ?? String(err)}`
+    };
+  }
   const displayUrl = redactRpcUrl(url);
   const chain = network === "mainnet" ? mainnet : sepolia;
   const expectedChainId = network === "mainnet" ? 1 : 11_155_111;
