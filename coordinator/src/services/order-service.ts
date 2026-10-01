@@ -365,78 +365,21 @@ export class OrderService {
     });
   }
 
-  /**
-   * Preimage relayed for an order (`secret` edge).
-   *
-   * The preimage is the identity of this step, the transaction hash is only
-   * provenance: the same preimage can legitimately be relayed from a second
-   * transaction (a claim observed on the other chain, an RPC retry, a re-org),
-   * so re-relaying it is idempotent instead of a conflict.
-   */
-  async recordSecret(
-    publicId: string,
-    preimage: string,
-    txHash: string,
-    writer?: string
-  ): Promise<void> {
-    const canonical = preimage.toLowerCase();
-    await this.advance({
-      publicId,
-      action: "secret",
-      txHash,
-      writer,
-      isSameStep: (order) => order.preimage === canonical,
-      logMessage: "secret recorded",
-      apply: async () => {
-        await this.repo.recordSecretRevealed({ publicId, preimage: canonical, txHash });
-      }
-    });
-  }
-
-  /**
-   * The order was claimed on chain (`claim` edge).
-   *
-   * Refused unless the preimage has been recorded first — that is the guard
-   * against a listener settling an order twice or settling one whose secret
-   * the coordinator never saw.
-   */
-  async recordClaim(input: {
-    publicId: string;
-    txHash: string;
-    writer?: string;
-  }): Promise<void> {
-    await this.advance({
-      publicId: input.publicId,
-      action: "claim",
-      txHash: input.txHash,
-      writer: input.writer,
-      // A second claim for an order that is already completed is the same
-      // settlement observed again — idempotent, never a second payout.
-      isSameStep: () => true,
-      logMessage: "claim recorded",
-      apply: async () => {
-        await this.repo.setStatus(input.publicId, "completed", input.txHash);
-      }
-    });
-  }
-
-  /** A refund was observed on chain (`refund` edge). */
-  async recordRefund(input: {
-    publicId: string;
-    txHash: string;
-    writer?: string;
-  }): Promise<void> {
-    await this.advance({
-      publicId: input.publicId,
-      action: "refund",
-      txHash: input.txHash,
-      writer: input.writer,
-      isSameStep: () => true,
-      logMessage: "refund recorded",
-      apply: async () => {
-        await this.repo.setStatus(input.publicId, "refunded", input.txHash);
-      }
-    });
+  async recordSecret(publicId: string, preimage: string, txHash: string): Promise<void> {
+    const order = await this.repo.findByPublicId(publicId);
+    if (!order) throw new OrderValidationError(`unknown order ${publicId}`);
+    if (order.status === "secret_revealed") {
+      // Idempotent: same preimage for the same order is always accepted,
+      // even if the txHash differs (e.g. a second chain event observer).
+      if (order.preimage === preimage) return;
+      throw new StaleOrderEventError(`conflicting secret event for ${publicId}`);
+    }
+    if (!canTransition(order.status, "secret_revealed")) {
+      throw new StaleOrderEventError(`stale secret event for order in status ${order.status}`);
+    }
+    await this.repo.recordSecretRevealed({ publicId, preimage, txHash });
+    this.log.info({ publicId }, "secret recorded");
+    ordersTotal.inc({ status: "secret_revealed" });
   }
 
   async getOrderMetrics(): Promise<OrderMetrics> {
