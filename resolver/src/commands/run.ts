@@ -5,7 +5,7 @@ import { SorobanListener } from "../listeners/soroban.js";
 import { checkDeploymentAddresses, checkPreflight } from "./check.js";
 import { buildPlan } from "../planner/index.js";
 import { observedFromEthereumEvent } from "../planner/index.js";
-import { checkCoordinatorNetwork } from "../network-agreement.js";
+import { checkCoordinatorNetwork, checkResolverNetworkAgreement } from "../network-agreement.js";
 
 export interface RunOptions {
   dryRun?: boolean;
@@ -17,7 +17,16 @@ export async function runCommand(opts: RunOptions = {}): Promise<void> {
   const log = getLogger(cfg.logLevel);
   log.info({ network: cfg.network, dryRun }, "OverSync resolver starting");
 
-  await checkDeploymentAddresses(cfg);
+  // Check resolver's own RPC network agreement
+  const resolverAgreement = await checkResolverNetworkAgreement(
+    cfg.network,
+    cfg.ethereum.rpcUrl,
+    cfg.soroban.rpcUrl,
+    cfg.soroban.networkPassphrase
+  );
+  if (resolverAgreement.status === "fail") {
+    throw new Error(`Network agreement failed: ${resolverAgreement.detail}. Observed: EVM=${resolverAgreement.observed.evm.rpcUrl} (chainId=${resolverAgreement.observed.evm.chainId}), Soroban=${resolverAgreement.observed.soroban.rpcUrl} (passphrase=${resolverAgreement.observed.soroban.networkPassphrase})`);
+  }
 
   // Refuse to start when the configured coordinator targets a different
   // chain. Unreachable coordinators remain a warning so observation mode can

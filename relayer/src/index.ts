@@ -167,7 +167,7 @@ function getEscrowFactoryABI(isMainnet: boolean) {
   return isMainnet ? MAINNET_ESCROW_FACTORY_ABI : TESTNET_ESCROW_FACTORY_ABI;
 }
 import { ethereumListener } from './ethereum-listener.js';
-import { quoterService } from './quoter-service.js';
+import { quoterService, type QuoteResponse } from './quoter-service.js';
 import { ordersService } from './orders.js';
 import { gasPriceTracker } from './gas-tracker.js';
 import { presetManager } from './preset-manager.js';
@@ -926,7 +926,10 @@ async function initializeRelayer() {
     try {
       console.log('🔍 RAW REQUEST BODY:', JSON.stringify(req.body, null, 2));
       
-      const { fromChain, toChain, fromToken, toToken, amount, ethAddress, stellarAddress, direction, exchangeRate, network, networkMode } = req.body;
+      const {
+        fromChain, toChain, fromToken, toToken, amount, ethAddress, stellarAddress,
+        direction, exchangeRate, network, networkMode, coordinatorQuoteId, relayerQuote
+      } = req.body;
       
       console.log('🎯 EXTRACTED VALUES:', {
         amount: amount,
@@ -1024,7 +1027,7 @@ async function initializeRelayer() {
               contractType: 'MOCK_1INCH_ESCROW_FACTORY'
             };
             
-            await storeActiveOrder(orderId, orderData);
+            await storeActiveOrder(orderId, { ...orderData, coordinatorQuoteId, relayerQuote });
             
             return res.json({
               success: true,
@@ -1127,7 +1130,9 @@ async function initializeRelayer() {
           // ✅ Add networkMode for XLM→ETH processing
           await storeActiveOrder(orderId, {
             ...orderData,
-            networkMode: requestNetwork
+            networkMode: requestNetwork,
+            coordinatorQuoteId,
+            relayerQuote
           });
           
           const totalCost = userAmountWei + actualSafetyDeposit;
@@ -1244,7 +1249,9 @@ async function initializeRelayer() {
           stellarAddress,
           amount: orderData.amount,  // ✅ Use wei format, not decimal string
           exchangeRate: exchangeRate || ETH_TO_XLM_RATE,
-          networkMode: requestNetwork  // ✅ Store network for XLM→ETH processing
+          networkMode: requestNetwork,  // ✅ Store network for XLM→ETH processing
+          coordinatorQuoteId,
+          relayerQuote
         });
 
         console.log('✅ TESTNET ETH→XLM Order created:', orderId);
@@ -1353,7 +1360,7 @@ async function initializeRelayer() {
             contractType: 'MOCK_DUAL_HTLC'
           };
           
-          await storeActiveOrder(orderId, orderData);
+          await storeActiveOrder(orderId, { ...orderData, coordinatorQuoteId, relayerQuote });
 
           return res.json({
             success: true,
@@ -1439,7 +1446,7 @@ async function initializeRelayer() {
           }
         };
 
-        await storeActiveOrder(orderId, orderData);
+        await storeActiveOrder(orderId, { ...orderData, coordinatorQuoteId, relayerQuote });
 
         res.json({
           success: true,
@@ -1888,7 +1895,9 @@ async function initializeRelayer() {
         let payoutTxHash: string;
         let payoutResult: any;
         try {
-          const submission = await relaySubmissionTracker.submit(
+          const submission = await quoterService.submitIfCoordinatorQuoteMatches(
+            storedOrder.relayerQuote as QuoteResponse | undefined,
+            storedOrder.coordinatorQuoteId as string | undefined,
             {
               orderId,
               side: 'eth_to_xlm',
@@ -1898,13 +1907,8 @@ async function initializeRelayer() {
               destination: userStellarAddress,
               amount: xlmAmount,
             },
-            () =>
-              stageStellarTransaction({
-                server: server as never,
-                transaction,
-                network: dynamicNetwork,
-                label: 'eth->xlm payout',
-              })
+            relaySubmissionTracker,
+            () => server.submitTransaction(transaction)
           );
           payoutResult = submission.result;
           payoutTxHash = submission.txHash ?? payoutResult?.hash;

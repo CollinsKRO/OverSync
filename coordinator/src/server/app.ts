@@ -7,8 +7,8 @@ import { httpRequestDuration } from "../metrics.js";
 import { ordersRoutes } from "./routes/orders.js";
 import { secretsRoutes } from "./routes/secrets.js";
 import { quotesRoutes } from "./routes/quotes.js";
-import { createCorsMiddleware } from "./cors.js";
-import { publicResponseRedaction } from "./public-response-redaction.js";
+import { createCorsMiddleware, createStrictCorsMiddleware } from "./cors.js";
+import { createReadinessRateLimiter } from "./readiness-rate-limit.js";
 import type { OrderService } from "../services/order-service.js";
 import type { SecretService } from "../services/secret-service.js";
 import type { QuoteService } from "../services/quote-service.js";
@@ -21,6 +21,8 @@ export interface AppDeps {
   orders: OrderService;
   secrets: SecretService;
   quotes: QuoteService;
+  /** Deployment network. Pagination cursors are bound to it. */
+  network?: "testnet" | "mainnet";
 }
 
 export function createApp(deps: AppDeps): Express {
@@ -45,7 +47,7 @@ export function createApp(deps: AppDeps): Express {
   const readinessWindowMs = Number(process.env.COORDINATOR_READINESS_RATE_WINDOW_MS ?? 60_000);
   app.use(healthRoutes({ limit: readinessLimit, windowMs: readinessWindowMs }));
   app.use(metricsRoutes());
-  app.use("/api", ordersRoutes(deps.orders));
+  app.use("/api", ordersRoutes(deps.orders, { network: deps.network }));
   app.use("/api", secretsRoutes(deps.secrets));
   app.use("/api", quotesRoutes(deps.quotes));
   app.use("/api", orderMetricsRoutes(deps.orders));

@@ -40,6 +40,15 @@ describe("simulateRefundTimeline", () => {
       }));
       expect(result.state).toBe("waiting");
     });
+
+    it("does not report refundable when the source lock has not been observed", () => {
+      const result = simulateRefundTimeline(make({
+        sourceLockObserved: false,
+        sourceTimelockUnixSeconds: NOW - 1,
+        destinationTimelockUnixSeconds: NOW - 1,
+      }));
+      expect(result.state).toBe("waiting");
+    });
   });
 
   describe("claimable state", () => {
@@ -75,28 +84,30 @@ describe("simulateRefundTimeline", () => {
   });
 
   describe("refundable state", () => {
-    it("returns refundable when source timelock has expired", () => {
+    it("returns refundable only after both chain timelocks have expired", () => {
       const result = simulateRefundTimeline(make({
         sourceTimelockUnixSeconds: NOW - 1,
+        destinationTimelockUnixSeconds: NOW - 1,
       }));
       expect(result.state).toBe("refundable");
       expect(result.stateLabel).toBe("Refundable");
       expect(result.refundableBy).toMatch(/refund/);
     });
 
-    it("returns refundable when source timelock has expired even if destination is locked", () => {
+    it("does not allow refund while the destination timelock is still active", () => {
       const result = simulateRefundTimeline(make({
         sourceTimelockUnixSeconds: NOW - 1,
         destinationLockObserved: true,
         destinationTimelockUnixSeconds: NOW + 1800,
       }));
-      expect(result.state).toBe("refundable");
+      expect(result.state).toBe("claimable");
     });
 
     it("returns refundable for xlm_to_eth when source timelock expired", () => {
       const result = simulateRefundTimeline(make({
         direction: "xlm_to_eth",
         sourceTimelockUnixSeconds: NOW - 1,
+        destinationTimelockUnixSeconds: NOW - 1,
       }));
       expect(result.state).toBe("refundable");
       expect(result.refundableBy).toMatch(/XLM/);
@@ -106,16 +117,26 @@ describe("simulateRefundTimeline", () => {
       const result = simulateRefundTimeline(make({
         direction: "eth_to_xlm",
         sourceTimelockUnixSeconds: NOW - 1,
+        destinationTimelockUnixSeconds: NOW - 1,
       }));
       expect(result.state).toBe("refundable");
       expect(result.refundableBy).toMatch(/ETH/);
     });
 
-    it("returns refundable when source timelock is exactly now", () => {
+    it("does not refund at the exact source timelock second", () => {
       const result = simulateRefundTimeline(make({
         sourceTimelockUnixSeconds: NOW,
+        destinationTimelockUnixSeconds: NOW - 1,
       }));
-      expect(result.state).toBe("refundable");
+      expect(result.state).toBe("waiting");
+    });
+
+    it("waits until the destination timelock is strictly expired", () => {
+      const result = simulateRefundTimeline(make({
+        sourceTimelockUnixSeconds: NOW - 1,
+        destinationTimelockUnixSeconds: NOW,
+      }));
+      expect(result.state).toBe("claimable");
     });
   });
 
@@ -160,7 +181,10 @@ describe("simulateRefundTimeline", () => {
     });
 
     it("refundable description mentions source chain", () => {
-      const result = simulateRefundTimeline(make({ sourceTimelockUnixSeconds: NOW - 1 }));
+      const result = simulateRefundTimeline(make({
+        sourceTimelockUnixSeconds: NOW - 1,
+        destinationTimelockUnixSeconds: NOW - 1,
+      }));
       expect(result.stateDescription).toMatch(/Ethereum/);
     });
   });
@@ -178,6 +202,7 @@ describe("simulateRefundTimeline", () => {
       const result = simulateRefundTimeline(make({
         direction: "xlm_to_eth",
         sourceTimelockUnixSeconds: NOW - 1,
+        destinationTimelockUnixSeconds: NOW - 1,
       }));
       expect(result.stateDescription).toMatch(/Stellar/);
     });

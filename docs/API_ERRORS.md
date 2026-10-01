@@ -52,6 +52,87 @@ And for secret-related errors:
 
 ---
 
+## HTTP 409 — Illegal Order Transition
+
+Every writer (the HTTP API, the secret service, the Ethereum listener and the Soroban listener) applies order lifecycle changes through the coordinator's order state machine. An event that **skips**, **repeats** or **rewinds** a lifecycle step is refused: the stored order status is left exactly where it was, the attempt is persisted in the order's audit trail, and the caller gets `409`.
+
+```json
+{
+  "error": "illegal_transition",
+  "code": "illegal_transition_claim_before_secret",
+  "from": "src_locked",
+  "to": "completed",
+  "action": "claim",
+  "message": "Refused a claim for an order whose preimage has not been recorded (src_locked -> completed)"
+}
+```
+
+`code` is stable and safe to switch on. The current codes:
+
+| `code` | Meaning |
+|--------|---------|
+| `illegal_transition_secret_before_escrow` | A preimage was relayed for an order that is still `announced` (no source escrow yet). |
+| `illegal_transition_secret_relay_before_escrow` | A destination lock arrived before the source leg was escrowed. |
+| `illegal_transition_claim_before_secret` | A claim was applied before the preimage was recorded. |
+| `illegal_transition_refund_after_claim` | A refund was applied to an order that was already claimed (settled). |
+| `illegal_transition_late_step` | The event belongs to a lifecycle step the order has already moved past (a late/out-of-order chain event). |
+| `illegal_transition_repeated_step` | The same step arrived again with an identical payload. The call is idempotent — chain listeners redeliver, so repeated steps are recorded but do not move the order and do not fail the caller. |
+| `illegal_transition_conflicting_step` | The same step arrived again with a **different** payload (for example the same source lock from a different transaction). |
+| `illegal_transition_already_settled` | The order is in a terminal state (`completed`, `refunded`, `failed`) and cannot be advanced again. |
+| `illegal_transition_not_allowed` | Any other pair of statuses that is not a legal edge. |
+
+The legal edges are, in lifecycle order:
+
+```
+announced       --escrow-->        src_locked
+src_locked      --secret_relay-->  dst_locked
+src_locked | dst_locked --secret--> secret_revealed
+secret_revealed --claim-->         completed
+src_locked | dst_locked | secret_revealed | expired --refund--> refunded
+```
+
+`secret_revealed -> refunded` stays legal on purpose: a source-leg timeout after the preimage became public is a real on-chain outcome, and this database is a cache of on-chain truth. The refund edge that is refused is `completed -> refunded`.
+
+**Routes that can answer 409**
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/api/orders/:id/src-locked` | Source escrow |
+| `POST` | `/api/orders/:id/dst-locked` | Resolver destination lock |
+| `POST` | `/api/secrets/reveal` | Preimage relay (previously answered `400 secret_error`) |
+
+### Querying refused transitions
+
+Refused attempts are persisted per order with the code above, the writer that was refused (`order-service`, `ethereum-listener`, `soroban-listener`) and the offending transaction, so an operator can tell a late listener event apart from a client bug without reading logs.
+
+```
+GET /api/orders/:id/rejected-transitions
+```
+
+```json
+{
+  "status": "src_locked",
+  "rejectedTransitions": [
+    {
+      "from": "src_locked",
+      "to": "completed",
+      "action": "claim",
+      "code": "illegal_transition_claim_before_secret",
+      "reason": "Refused a claim for an order whose preimage has not been recorded (src_locked -> completed)",
+      "txHash": "0xclaim",
+      "writer": "ethereum-listener",
+      "timestamp": 1759180000
+    }
+  ]
+}
+```
+
+`GET /api/orders/:id/transitions` returns the applied transition history in `transitions` and the same refused attempts in `rejectedTransitions`; refused attempts never appear in `transitions`, because they never changed the order.
+
+The refusal count is also exported as the `coordinator_illegal_order_transitions_total{code="…"}` Prometheus counter on `/metrics`.
+
+---
+
 ## HTTP 404 — Not Found
 
 ```json

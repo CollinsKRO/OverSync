@@ -1,6 +1,29 @@
 export type TimelockValidationError = 'TIMELOCKS_REVERSED' | 'GAP_TOO_SMALL';
 
-export type SecretWindowError = 'SRC_TIMELOCK_EXPIRED' | 'DST_TIMELOCK_EXPIRED';
+export type RefundChain = 'ethereum' | 'stellar';
+
+export interface RefundEligibility {
+  eligible: boolean;
+  lockedSides: Array<{
+    chain: RefundChain;
+    earliestRefundAt: number | null;
+  }>;
+}
+
+/** Evaluates both persisted chain timelocks using one coordinator clock. */
+export function evaluateRefundEligibility(
+  timelocks: Record<RefundChain, number | null>,
+  nowUnixSeconds: number
+): RefundEligibility {
+  const lockedSides = (Object.entries(timelocks) as Array<[RefundChain, number | null]>)
+    .filter(([, timelock]) => timelock === null || nowUnixSeconds <= timelock)
+    .map(([chain, timelock]) => ({
+      chain,
+      earliestRefundAt: timelock === null ? null : timelock + 1
+    }));
+
+  return { eligible: lockedSides.length === 0, lockedSides };
+}
 
 /**
  * Validates that the destination timelock is safely before the source timelock.

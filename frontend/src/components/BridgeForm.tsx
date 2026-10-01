@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Horizon, 
   Asset, 
@@ -11,6 +11,8 @@ import type { NetworkModeState } from '../lib/useNetworkMode';
 import { parseHtlcReceipt } from '../lib/parseHtlcReceipt';
 import { sanitizeAmountInput, parseAmountToBaseUnits } from '../lib/sanitizeAmountInput';
 import { AlertTriangle, ArrowDownUp, CheckCircle2, Loader2, RefreshCw, Settings2 } from 'lucide-react';
+import { useBackendStatus } from '../lib/useBackendStatus';
+import { wakeBackend } from '../lib/wakeBackend';
 
 // Web3 imports for contract interaction
 declare global {
@@ -164,6 +166,9 @@ const ENABLE_MOCK_DATA = import.meta.env.VITE_ENABLE_MOCK_DATA === 'true';
 
 export default function BridgeForm({ ethAddress, stellarAddress, signStellarTransaction, networkState }: BridgeFormProps) {
   const [direction, setDirection] = useState<'eth_to_xlm' | 'xlm_to_eth'>('eth_to_xlm');
+  const { status: backendStatus, isReady: backendReady, isLoading: backendLoading, refresh: refreshBackendStatus } = useBackendStatus();
+  const [isWakingBackend, setIsWakingBackend] = useState(false);
+  const wakeInFlightRef = useRef(false);
   const [networkInfo, setNetworkInfo] = useState(() => {
     const currentNetwork = getCurrentNetwork();
     const isTestnetMode = isTestnet();
@@ -560,12 +565,8 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
       return;
     }
 
-    // Parse the amount to base units exactly once, with no floating point.
-    // The coordinator applies the same parse, and this integer (not the raw
-    // text) is what the order request carries.
-    const amountBaseUnits = parseAmountToBaseUnits(amount, fromToken.decimals);
-    if (amountBaseUnits === null || amountBaseUnits === 0n) {
-      alert(`Enter a positive amount with at most ${fromToken.decimals} decimal places.`);
+    if (!backendReady) {
+      alert('Coordinator is not ready yet. Please wait for the health check to pass.');
       return;
     }
     
@@ -1318,6 +1319,35 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
   // Check if wallets are connected
   const walletsConnected = ethAddress && stellarAddress;
 
+  // ---- Backend readiness guardrails ----
+  const backendNotReady = backendLoading || !backendReady;
+  const backendStatusLabel = useMemo(() => {
+    if (backendLoading) return 'Checking coordinator...';
+    if (!backendReady) {
+      if (backendStatus === 'down') return 'Coordinator is down';
+      if (backendStatus === 'not-ready') return 'Coordinator is starting up';
+      return 'Coordinator is not ready';
+    }
+    return null;
+  }, [backendLoading, backendReady, backendStatus]);
+
+  const handleWakeBackend = async () => {
+    if (wakeInFlightRef.current) return;
+    wakeInFlightRef.current = true;
+    setIsWakingBackend(true);
+    try {
+      // Wake must only re-check health; it must never post an order.
+      await wakeBackend();
+      await refreshBackendStatus();
+    } catch (err) {
+      console.warn('wakeBackend failed:', err);
+    } finally {
+      wakeInFlightRef.current = false;
+      setIsWakingBackend(false);
+    }
+  };
+  // ---- end backend readiness guardrails ----
+
   // ---- Network mismatch guardrails ----
   const mismatchInfo = useMemo(() => {
     const ns = networkState;
@@ -1352,6 +1382,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
 
   const isBlocked = mismatchInfo?.blocked === true || networkState?.guard?.disableUiActions === true;
   const mismatchLabel = mismatchInfo?.label ?? null;
+  const actionsDisabled = isBlocked || backendNotReady;
   // ---- end mismatch guardrails ----
 
   return (
@@ -1643,6 +1674,24 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
             </div>
           )}
 
+          {/* Backend Not Ready Warning */}
+          {backendStatusLabel && (
+            <div className="flex items-start gap-2.5 rounded-2xl border border-amber-400/35 bg-amber-500/12 p-3 text-left">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+              <div className="flex-1">
+                <p className="text-sm text-amber-100/90">{backendStatusLabel}</p>
+                <button
+                  type="button"
+                  onClick={handleWakeBackend}
+                  disabled={isWakingBackend}
+                  className="mt-2 rounded-full border border-amber-200/40 bg-amber-200/10 px-3 py-1 text-xs font-semibold text-amber-100 transition hover:border-amber-100/60 hover:bg-amber-200/20 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isWakingBackend ? 'Checking...' : 'Retry health check'}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Disconnected Wallet Warning */}
           {!mismatchLabel && (!ethAddress || !stellarAddress) && (
             <div className="flex items-start gap-2.5 rounded-2xl border border-amber-400/35 bg-amber-500/12 p-3 text-left">
@@ -1670,7 +1719,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
           {/* Submit Button */}
           <button
             type="submit"
-            disabled={isSubmitting || !amount || !walletsConnected || isBlocked}
+            disabled={isSubmitting || !amount || !walletsConnected || actionsDisabled}
             className={`button-hover-scale w-full rounded-full py-3.5 font-semibold transition-all ${
               walletsConnected && !isBlocked
                 ? 'brand-cta'
@@ -1681,6 +1730,8 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
               ? 'Connect Wallet'
               : networkState?.guard?.disableUiActions
                 ? 'Mainnet Gated'
+                : backendNotReady
+                  ? (backendLoading ? 'Checking coordinator...' : 'Coordinator not ready')
                 : isBlocked
                   ? 'Network Mismatch'
                   : isSubmitting

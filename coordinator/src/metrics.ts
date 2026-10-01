@@ -19,6 +19,18 @@ export const ordersTotal = new Counter({
   registers: [registry]
 });
 
+/**
+ * Illegal / refused order transitions, labelled with the stable failure
+ * code from the order state machine. A non-zero rate here means a chain
+ * listener or a client tried to skip, repeat or rewind a lifecycle step.
+ */
+export const illegalOrderTransitions = new Counter({
+  name: "coordinator_illegal_order_transitions_total",
+  help: "Total refused order transitions by stable failure code",
+  labelNames: ["code"] as const,
+  registers: [registry]
+});
+
 /** Last block number seen by each listener */
 export const listenerLastBlock = new Gauge({
   name: "coordinator_listener_last_block",

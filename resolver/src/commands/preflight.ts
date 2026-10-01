@@ -3,6 +3,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { sepolia, mainnet } from "viem/chains";
 import { rpc, Contract, Keypair, TransactionBuilder, Networks, nativeToScVal, scValToNative } from "@stellar/stellar-sdk";
 import { loadConfig } from "../config.js";
+import { checkResolverNetworkAgreement } from "../network-agreement.js";
 
 const EVM_KEY_RE = /^0x[0-9a-fA-F]{64}$/;
 const EVM_ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
@@ -30,6 +31,25 @@ export interface PreflightCheckResult {
 export async function runPreflightChecks(): Promise<PreflightCheckResult[]> {
   const results: PreflightCheckResult[] = [];
   const cfg = loadConfig();
+
+  // -------------------------------------------------------------
+  // Network Agreement Check (must pass before any other checks)
+  // -------------------------------------------------------------
+  const agreement = await checkResolverNetworkAgreement(
+    cfg.network,
+    cfg.ethereum.rpcUrl,
+    cfg.soroban.rpcUrl,
+    cfg.soroban.networkPassphrase
+  );
+  results.push({
+    name: "EVM and Soroban networks agree with configured network",
+    status: agreement.status === "ok" ? "PASS" : "FAIL",
+    detail: agreement.detail,
+    guidance: agreement.status === "fail" ? "Ensure both RPC endpoints target the same network (testnet or mainnet) as NETWORK_MODE" : undefined
+  });
+
+  // If network agreement fails, skip remaining checks that require RPC connectivity
+  const skipRpcChecks = agreement.status === "fail";
 
   // -------------------------------------------------------------
   // Ethereum / EVM Checks
@@ -91,13 +111,13 @@ export async function runPreflightChecks(): Promise<PreflightCheckResult[]> {
     });
   }
 
-  // 3. EVM Network matches expected testnet configuration
+  // 3. EVM Network matches expected network configuration
   let isEvmRpcConfigured = false;
-  if (cfg.network !== "testnet") {
+  if (skipRpcChecks) {
     results.push({
-      name: "Ethereum network matches expected testnet configuration",
-      status: "FAIL",
-      guidance: "Switch NETWORK_MODE to testnet"
+      name: "Ethereum network matches expected network configuration",
+      status: "SKIPPED",
+      guidance: "Skipped due to network agreement failure"
     });
   } else {
     // Try pinging EVM RPC
@@ -105,23 +125,24 @@ export async function runPreflightChecks(): Promise<PreflightCheckResult[]> {
       const chain = cfg.ethereum.chainId === 1 ? mainnet : sepolia;
       const client = createPublicClient({ chain, transport: http(cfg.ethereum.rpcUrl, { timeout: 4000 }) });
       const chainId = await client.getChainId();
-      if (chainId === 11_155_111) {
+      const expectedChainId = cfg.network === "mainnet" ? 1 : 11_155_111;
+      if (chainId === expectedChainId) {
         isEvmRpcConfigured = true;
         results.push({
-          name: "Ethereum network matches expected testnet configuration",
+          name: "Ethereum network matches expected network configuration",
           status: "PASS",
-          detail: `Sepolia testnet (chainId ${chainId})`
+          detail: `${cfg.network === "mainnet" ? "Mainnet" : "Sepolia testnet"} (chainId ${chainId})`
         });
       } else {
         results.push({
-          name: "Ethereum network matches expected testnet configuration",
+          name: "Ethereum network matches expected network configuration",
           status: "FAIL",
-          guidance: `Switch to the expected testnet (Sepolia chainId 11155111, got ${chainId})`
+          guidance: `Switch to the expected network (${cfg.network} chainId ${expectedChainId}, got ${chainId})`
         });
       }
     } catch (err: any) {
       results.push({
-        name: "Ethereum network matches expected testnet configuration",
+        name: "Ethereum network matches expected network configuration",
         status: "SKIPPED",
         guidance: `Configure RPC_URL or verify EVM RPC reachability: ${err.message}`
       });
@@ -284,13 +305,13 @@ export async function runPreflightChecks(): Promise<PreflightCheckResult[]> {
     });
   }
 
-  // 8. Stellar Network matches expected testnet configuration
+  // 8. Stellar Network matches expected network configuration
   let isStellarRpcConfigured = false;
-  if (cfg.network !== "testnet") {
+  if (skipRpcChecks) {
     results.push({
-      name: "Stellar network matches expected testnet configuration",
-      status: "FAIL",
-      guidance: "Switch NETWORK_MODE to testnet"
+      name: "Stellar network matches expected network configuration",
+      status: "SKIPPED",
+      guidance: "Skipped due to network agreement failure"
     });
   } else {
     try {
@@ -301,30 +322,33 @@ export async function runPreflightChecks(): Promise<PreflightCheckResult[]> {
       // Ping Soroban RPC using getLatestLedger
       const latest = await server.getLatestLedger();
       if (latest && latest.sequence !== undefined) {
-        if (cfg.soroban.networkPassphrase === "Test SDF Network ; September 2015") {
+        const expectedPassphrase = cfg.network === "mainnet"
+          ? "Public Global Stellar Network ; September 2015"
+          : "Test SDF Network ; September 2015";
+        if (cfg.soroban.networkPassphrase === expectedPassphrase) {
           isStellarRpcConfigured = true;
           results.push({
-            name: "Stellar network matches expected testnet configuration",
+            name: "Stellar network matches expected network configuration",
             status: "PASS",
-            detail: "Test SDF Network"
+            detail: cfg.network === "mainnet" ? "Public Global Stellar Network" : "Test SDF Network"
           });
         } else {
           results.push({
-            name: "Stellar network matches expected testnet configuration",
+            name: "Stellar network matches expected network configuration",
             status: "FAIL",
-            guidance: "Switch Stellar RPC network passphrase to expected testnet"
+            guidance: `Switch Stellar RPC network passphrase to expected ${cfg.network}`
           });
         }
       } else {
         results.push({
-          name: "Stellar network matches expected testnet configuration",
+          name: "Stellar network matches expected network configuration",
           status: "FAIL",
           guidance: "Stellar RPC returned invalid ledger sequence"
         });
       }
     } catch (err: any) {
       results.push({
-        name: "Stellar network matches expected testnet configuration",
+        name: "Stellar network matches expected network configuration",
         status: "SKIPPED",
         guidance: `Configure SOROBAN_RPC_URL or verify Stellar RPC reachability: ${err.message}`
       });

@@ -1,6 +1,16 @@
 import { Router } from "express";
-import { AmountParseError, QuoteExpiredError, QuoteNotFoundError } from "../../services/quote-service.js";
+import { z } from "zod";
+import { QuoteExpiredError, QuoteNotFoundError } from "../../services/quote-service.js";
 import type { QuoteService } from "../../services/quote-service.js";
+
+const quoteTermsSchema = z.object({
+  srcChain: z.enum(["ethereum", "stellar"]),
+  srcAsset: z.string().min(1),
+  srcAmount: z.string().regex(/^\d+$/),
+  dstChain: z.enum(["ethereum", "stellar"]),
+  dstAsset: z.string().min(1),
+  dstAmount: z.string().regex(/^\d+$/)
+});
 
 export function quotesRoutes(quotes: QuoteService): Router {
   const router = Router();
@@ -19,24 +29,17 @@ export function quotesRoutes(quotes: QuoteService): Router {
    */
   router.get("/quotes/eth-xlm", async (req, res, next) => {
     try {
-      const rawAmount = req.query.amount;
-      if (rawAmount !== undefined && typeof rawAmount !== "string") {
-        res.status(400).json({ error: "invalid_amount", message: "amount must be a single value" });
-        return;
-      }
-      let quote;
-      try {
-        quote = await quotes.quoteEthXlm({ amountBaseUnits: rawAmount });
-      } catch (err) {
-        if (err instanceof AmountParseError) {
-          res.status(400).json({ error: "invalid_amount", message: err.message });
-          return;
-        }
-        throw err;
-      }
+      const terms = quoteTermsSchema.parse(req.query);
+      const quote = await quotes.quoteEthXlm(terms);
       res.json({
         quoteId: quote.quoteId,
         pair: quote.pair,
+        srcChain: quote.srcChain,
+        srcAsset: quote.srcAsset,
+        srcAmount: quote.srcAmount,
+        dstChain: quote.dstChain,
+        dstAsset: quote.dstAsset,
+        dstAmount: quote.dstAmount,
         ethUsd: quote.srcUsd,
         xlmUsd: quote.dstUsd,
         source: quote.source,
@@ -47,6 +50,10 @@ export function quotesRoutes(quotes: QuoteService): Router {
         freshMs: quote.expiresAt - Date.now()
       });
     } catch (err) {
+      if (err instanceof z.ZodError) {
+        res.status(400).json({ error: "validation_error", details: err.errors });
+        return;
+      }
       next(err);
     }
   });
@@ -71,7 +78,8 @@ export function quotesRoutes(quotes: QuoteService): Router {
         issuedAt: quote.issuedAt,
         expiresAt: quote.expiresAt,
         freshMs: quote.expiresAt - Date.now(),
-        source: quote.source
+        source: quote.source,
+        ...quote.terms
       });
     } catch (err) {
       if (err instanceof QuoteExpiredError) {

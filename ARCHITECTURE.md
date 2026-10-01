@@ -1,6 +1,6 @@
-# OverSync v2 — Architecture
+#OverSync v2 — Architecture
 
-> **Status:** OverSync is being rebuilt as a non-custodial, multi-resolver,
+>**Status:** OverSync is being rebuilt as a non-custodial, multi-resolver,
 > HTLC-based bridge between Ethereum and Stellar. This document tracks the
 > **target** architecture. Code in this repository is in the middle of the
 > v1 → v2 transition; sections that describe behaviour not yet shipped are
@@ -26,10 +26,10 @@ have no admin escape hatch (no `emergencyWithdraw`, no `pause`, no
 `upgradeTo`). Locked funds can only move under exactly two on-chain
 conditions:
 
-1. A caller submits a `preimage` such that
-   `sha256(preimage) == hashlock` (or `keccak256(preimage) == hashlock`
-   on the EVM side) **and** `block.timestamp <= timelock`. The locked
-   amount goes to `beneficiary`.
+1. A caller submits a non-empty `preimage` such that
+  `sha256(uint256(orderId, big-endian) || preimage) == hashlock`
+  **and** `block.timestamp <= timelock`. The locked amount goes to
+  `beneficiary`.
 2. `block.timestamp > timelock` and any caller invokes `refund_order`.
    The locked amount returns to `refund_address`, which the contract
    pins to the original user at order-creation time.
@@ -59,15 +59,16 @@ Both contracts enforce the same invariants with the same parameters:
 |---|---|---|
 | Minimum timelock | `MIN_TIMELOCK = 300` (5 min) | `MIN_TIMELOCK_SECONDS = 300` |
 | Maximum timelock | `MAX_TIMELOCK = 86_400` (24 h) | `MAX_TIMELOCK_SECONDS = 86_400` |
-| Hashlock digest | sha256 **or** keccak256 of preimage | sha256 of preimage |
+| Hashlock digest | sha256(uint256 order ID || preimage) | sha256(uint256 order ID || preimage) |
 | Refund delivery | permissionless, paid to `refundAddress` | permissionless, paid to `refund_address` |
 | Safety deposit | configurable via `minSafetyDeposit` | configurable via `min_safety_deposit` |
 | Admin role over locked funds | none | none |
 
-The EVM contract accepts either sha256 or keccak256 because EVM tooling
-expects keccak by default but the Soroban side can only verify sha256.
-A single cross-chain swap uses sha256 end-to-end; the keccak path is
-provided for compatibility with classic EVM-only HTLC flows.
+Both sides use the exact same v1 encoding: the 32-byte big-endian EVM
+`uint256` order ID followed by the non-empty preimage bytes, hashed with
+SHA-256. The commitment must be prepared for the order ID each escrow
+will assign; Keccak-only commitments are not accepted by the v2 EVM
+escrow.
 
 ---
 
@@ -271,10 +272,9 @@ and verified by the resolver before it locks destination-side funds.
   `asset` (native ETH or any ERC-20) under `hashlock` and `timelock`.
   Optionally gated by `ResolverRegistry.isActive`. Stores
   `refundAddress = msg.sender`; this can never be re-pointed.
-- `claimOrder(uint256 orderId, bytes32 preimage)` — pays the locked
-  amount to `beneficiary` if `sha256(preimage) == hashlock` or
-  `keccak256(preimage) == hashlock`, and the safety deposit to
-  `msg.sender`.
+- `claimOrder(uint256 orderId, bytes preimage)` — pays the locked
+  amount to `beneficiary` if the non-empty preimage satisfies the shared
+  order-bound SHA-256 commitment and the safety deposit to `msg.sender`.
 - `refundOrder(uint256 orderId)` — permissionless after `timelock`.
   Pays the locked amount to `refundAddress` and the safety deposit to
   `msg.sender`.
@@ -308,8 +308,9 @@ and verified by the resolver before it locks destination-side funds.
   `is_active(sender)` call and reverts with `ResolverNotAuthorised`
   if the sender is not an active staked resolver; `claim_order` and
   `refund_order` are NOT gated by the registry.
-- `claim_order(env, order_id, preimage)` — `sha256(preimage) ==
-  hashlock` and `env.ledger().timestamp() <= timelock` are required.
+- `claim_order(env, order_id, preimage)` — the shared order-bound
+  SHA-256 commitment and `env.ledger().timestamp() <= timelock` are
+  required.
   Asset transferred to `beneficiary`, safety deposit to `caller`.
 - `refund_order(env, order_id)` — permissionless after `timelock`;
   asset to `refund_address`, safety deposit to `caller`.
@@ -808,10 +809,9 @@ mainnet deployment.
 
 ### 13.1 Solidity (`contracts/contracts/v2/`)
 
-- [ ] `HTLCEscrow.claimOrder` MUST require either
-      `sha256(preimage) == hashlock` or `keccak256(preimage) == hashlock`,
-      AND `block.timestamp <= timelock`. Both checks present, no
-      short-circuit that skips either.
+- [ ] `HTLCEscrow.claimOrder` MUST require a non-empty preimage and
+  `sha256(uint256(orderId, big-endian) || preimage) == hashlock`,
+  AND `block.timestamp <= timelock`.
 - [ ] `HTLCEscrow.refundOrder` MUST require `block.timestamp > timelock`
       AND order status is exactly `Locked`. Refund of an already-claimed
       or already-refunded order MUST revert.
@@ -835,8 +835,8 @@ mainnet deployment.
 
 ### 13.2 Soroban (`soroban/contracts/`)
 
-- [ ] `oversync-htlc::claim_order` requires
-      `sha256(preimage) == hashlock` AND
+- [ ] `oversync-htlc::claim_order` requires a non-empty preimage and
+  `sha256(uint256(order_id, 32-byte big-endian) || preimage) == hashlock` AND
       `env.ledger().timestamp() <= timelock`.
 - [ ] `oversync-htlc::refund_order` requires
       `env.ledger().timestamp() > timelock` AND order status is

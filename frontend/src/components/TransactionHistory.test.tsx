@@ -1,167 +1,324 @@
-import { render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, afterEach, describe, expect, test, vi } from 'vitest';
+/**
+ * Transaction history pagination.
+ *
+ * The orders API is stubbed with a *keyset* paginator: a cursor names the last
+ * order of the previous page and the stub serves whatever follows it. That is
+ * deliberate — an offset-based stub would let an off-by-one in the component
+ * pass, which is the exact failure this suite exists to catch.
+ */
+import { render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import TransactionHistory from './TransactionHistory';
 
-vi.mock('../config/networks', () => ({
-  isTestnet: () => true,
-}));
+const ETH_ADDRESS = '0x1111111111111111111111111111111111111111';
+const STELLAR_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB422';
 
-vi.mock('../features/refund/RefundDialog', () => ({
-  default: () => null,
-}));
+interface FixtureOrder {
+  id: string;
+  createdAt: number;
+  amount: string;
+}
 
-const STORAGE_KEY = 'oversync_transactions_v2';
+function makeOrders(count: number, baseCreatedAt: number): FixtureOrder[] {
+  return Array.from({ length: count }, (_, i) => ({
+    id: `order-${String(i + 1).padStart(2, '0')}`,
+    createdAt: baseCreatedAt - i,
+    amount: String(i + 1),
+  }));
+}
 
-function coordinatorOrder(overrides: Partial<Record<string, any>> = {}) {
+/** Atomic units, so the component's own decimal scaling is exercised. */
+const ETH_DECIMALS = 18;
+const XLM_DECIMALS = 7;
+
+function toAtomic(amount: string, decimals: number): string {
+  return `${amount}${'0'.repeat(decimals)}`;
+}
+
+/** Coordinator-shaped payload: raw amounts in atomic units. */
+function toCoordinatorOrder(order: FixtureOrder) {
   return {
-    id: 'order-recovered',
+    id: order.id,
     direction: 'eth_to_xlm',
-    status: 'src_locked',
-    hashlock: '0xhashlockrecovered',
+    status: 'completed',
+    hashlock: '0x' + 'a'.repeat(64),
     src: {
       chain: 'ethereum',
-      address: '0xEthAddress',
-      asset: 'ETH',
-      amount: '1000000000000000000',
-      safetyDeposit: '0',
-      orderId: '0xonchainorderid',
-      lockTx: '0xrecoveredlocktx',
+      address: ETH_ADDRESS,
+      asset: 'native',
+      amount: toAtomic(order.amount, ETH_DECIMALS),
+      safetyDeposit: '10',
+      orderId: '0x' + 'b'.repeat(64),
+      lockTx: '0x' + 'c'.repeat(64),
       lockBlock: 1,
-      timelock: 9999999999,
+      timelock: 1_800_000_000,
     },
     dst: {
       chain: 'stellar',
-      address: 'GSTELLARADDRESS',
-      asset: 'XLM',
-      amount: '10000000',
-      orderId: null,
+      address: STELLAR_ADDRESS,
+      asset: 'native',
+      amount: toAtomic(order.amount, XLM_DECIMALS),
+      orderId: '0x' + 'd'.repeat(64),
       lockTx: null,
       lockBlock: null,
-      timelock: null,
+      timelock: 1_700_000_000,
     },
-    secret: { revealed: false, preimage: null, revealedTx: null },
-    resolver: '0xResolverContract',
-    createdAt: Math.floor(Date.now() / 1000),
-    updatedAt: Math.floor(Date.now() / 1000),
-    ...overrides,
+    secret: { revealed: true, preimage: null, revealedTx: null },
+    resolver: '0x' + 'e'.repeat(40),
+    createdAt: order.createdAt,
+    updatedAt: order.createdAt,
   };
 }
 
-describe('TransactionHistory recovery', () => {
-  beforeEach(() => {
-    window.localStorage.clear();
-  });
+interface StubState {
+  orders: FixtureOrder[];
+  /** Inserted the first time page one is served — a new order mid-walk. */
+  insertAfterFirstPage: FixtureOrder | null;
+  /** Cursors the stub refuses to serve. */
+  rejectCursors: Set<string>;
+  requests: Array<Record<string, string>>;
+  pageLimit: number;
+}
 
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-  });
+let state: StubState;
 
-  test('recovers orders from the coordinator after reconnecting a wallet and renders them', async () => {
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      json: async () => ({ transactions: [coordinatorOrder()] }),
-    }));
-    vi.stubGlobal('fetch', fetchMock);
+function jsonResponse(status: number, body: unknown) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  } as unknown as Response;
+}
 
-    render(<TransactionHistory ethAddress="0xEthAddress" stellarAddress="GSTELLARADDRESS" />);
+function installOrdersApiStub() {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = new URL(String(input), 'http://coordinator.test');
+    const query = Object.fromEntries(url.searchParams.entries());
+    state.requests.push(query);
 
-    await waitFor(() => {
-      expect(screen.getByText('ETH Sepolia')).toBeInTheDocument();
+    const requestedNetwork = query.network;
+    if (requestedNetwork !== 'testnet') {
+      return jsonResponse(400, {
+        error: 'network_mismatch',
+        message: 'This coordinator serves testnet, not ' + requestedNetwork,
+      });
+    }
+
+    if (query.cursor && state.rejectCursors.has(query.cursor)) {
+      return jsonResponse(400, {
+        error: 'invalid_cursor',
+        reason: 'user_mismatch',
+        message: 'Cursor was issued for a different user',
+      });
+    }
+
+    let rows = state.orders;
+
+    // A new order lands after the caller has already seen page one, i.e.
+    // while page two is being served. Inserting it on the first request would
+    // just put it on page one and test nothing.
+    if (state.insertAfterFirstPage && state.requests.length === 2) {
+      rows = [state.insertAfterFirstPage, ...rows];
+      state.orders = rows;
+      state.insertAfterFirstPage = null;
+    }
+
+    let start = 0;
+    if (query.cursor) {
+      // The cursor names the last order of the previous page. Rows inserted
+      // above it must not move the boundary.
+      const boundary = rows.findIndex((o) => o.id === query.cursor);
+      start = boundary === -1 ? rows.length : boundary + 1;
+    }
+
+    const limit = Number(query.limit ?? state.pageLimit);
+    const page = rows.slice(start, start + limit);
+    const hasMore = start + limit < rows.length;
+    const last = page[page.length - 1];
+
+    return jsonResponse(200, {
+      transactions: page.map(toCoordinatorOrder),
+      pagination: {
+        limit,
+        count: page.length,
+        hasMore,
+        nextCursor: hasMore && last ? last.id : null,
+      },
     });
-
-    // One request per connected address, using the coordinator's `address` param.
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const requestedUrls = fetchMock.mock.calls.map((call) => String(call[0]));
-    expect(requestedUrls.some((u) => u.includes('address=0xEthAddress'))).toBe(true);
-    expect(requestedUrls.some((u) => u.includes('address=GSTELLARADDRESS'))).toBe(true);
-
-    // Recovered order persisted to local storage for the next reload.
-    const stored = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '[]');
-    expect(stored).toHaveLength(1);
-    expect(stored[0].id).toBe('order-recovered');
   });
 
-  test('de-duplicates a locally pending order against its coordinator-recovered counterpart', async () => {
-    const localTx = {
-      id: 'local-temp-id',
-      txHash: '0xrecoveredlocktx',
-      fromNetwork: 'ETH Sepolia',
-      toNetwork: 'Stellar Testnet',
-      fromToken: 'ETH',
-      toToken: 'XLM',
-      amount: '1',
-      estimatedAmount: '1',
-      status: 'pending',
-      timestamp: Date.now(),
-      direction: 'eth-to-xlm',
-      ethTxHash: '0xrecoveredlocktx',
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+/** Each order renders as "<amount> ETH" — count them to detect duplicates. */
+function renderedOrderIds(orders: FixtureOrder[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const order of orders) {
+    const found = screen.queryAllByText(`${order.amount} ETH`, { exact: true });
+    counts.set(order.id, found.length);
+  }
+  return counts;
+}
+
+function loadMoreButton() {
+  return screen.queryByRole('button', { name: /load more/i });
+}
+
+/** Click "Load more" until the coordinator stops handing out cursors. */
+async function walkToEnd(user: ReturnType<typeof userEvent.setup>) {
+  for (let guard = 0; guard < 20; guard += 1) {
+    const button = loadMoreButton();
+    if (!button) return;
+    const before = state.requests.length;
+    await user.click(button);
+    await waitFor(() => expect(state.requests.length).toBe(before + 1));
+    // Let the fold into the list settle before looking for the next cursor.
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+  }
+  throw new Error('Load more never went away');
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  vi.clearAllMocks();
+  state = {
+    // 12 orders at 5 per page => three pages (5, 5, 2).
+    orders: makeOrders(12, 1_700_000_000),
+    insertAfterFirstPage: null,
+    rejectCursors: new Set(),
+    requests: [],
+    pageLimit: 5,
+  };
+  installOrdersApiStub();
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('TransactionHistory cursor pagination', () => {
+  test('lists every order exactly once across three pages', async () => {
+    const user = userEvent.setup();
+    render(<TransactionHistory ethAddress={ETH_ADDRESS} stellarAddress={STELLAR_ADDRESS} />);
+
+    await waitFor(() => expect(screen.getByText('1 ETH')).toBeInTheDocument());
+    expect(screen.getByText('1 ETH')).toBeInTheDocument();
+    expect(screen.getByText('5 ETH')).toBeInTheDocument();
+    expect(screen.queryByText('6 ETH')).not.toBeInTheDocument();
+
+    await user.click(loadMoreButton()!);
+    await waitFor(() => expect(screen.getByText('6 ETH')).toBeInTheDocument());
+
+    await user.click(loadMoreButton()!);
+    await waitFor(() => expect(screen.getByText('12 ETH')).toBeInTheDocument());
+
+    for (const [id, count] of renderedOrderIds(state.orders)) {
+      expect(count, `${id} should render exactly once`).toBe(1);
+    }
+  });
+
+  test('hides the Load more button on the final page', async () => {
+    const user = userEvent.setup();
+    render(<TransactionHistory ethAddress={ETH_ADDRESS} stellarAddress={STELLAR_ADDRESS} />);
+
+    await waitFor(() => expect(loadMoreButton()).toBeInTheDocument());
+    await user.click(loadMoreButton()!);
+    await waitFor(() => expect(screen.getByText('6 ETH')).toBeInTheDocument());
+    await user.click(loadMoreButton()!);
+
+    await waitFor(() => expect(screen.queryByText('12 ETH')).toBeInTheDocument());
+    expect(loadMoreButton()).not.toBeInTheDocument();
+  });
+
+  test('an inserted row does not hide an existing order', async () => {
+    const user = userEvent.setup();
+    const newcomer: FixtureOrder = {
+      id: 'order-00',
+      createdAt: 1_700_000_001,
+      amount: '99',
     };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify([localTx]));
+    state.insertAfterFirstPage = newcomer;
 
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      json: async () => ({ transactions: [coordinatorOrder({ id: 'coordinator-final-id' })] }),
-    }));
-    vi.stubGlobal('fetch', fetchMock);
+    render(<TransactionHistory ethAddress={ETH_ADDRESS} stellarAddress={STELLAR_ADDRESS} />);
 
-    render(<TransactionHistory ethAddress="0xEthAddress" stellarAddress="GSTELLARADDRESS" />);
+    await waitFor(() => expect(screen.getByText('1 ETH')).toBeInTheDocument());
+    expect(screen.queryByText('99 ETH')).not.toBeInTheDocument();
 
-    await waitFor(() => {
-      const stored = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '[]');
-      expect(stored).toHaveLength(1);
-    });
+    await user.click(loadMoreButton()!);
+    await waitFor(() => expect(screen.getByText('6 ETH')).toBeInTheDocument());
+    await walkToEnd(user);
 
-    const stored = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '[]');
-    // The coordinator's record wins since it carries authoritative on-chain data,
-    // but the two entries were recognised as the same order (shared tx hash).
-    expect(stored[0].id).toBe('coordinator-final-id');
-
-    // Only a single row rendered for the deduped order, not two.
-    expect(screen.getAllByText('ETH Sepolia')).toHaveLength(1);
+    // Everything from the original fixture still shows, none of it twice. The
+    // newcomer is newer than the page-one boundary, so it is correctly not in
+    // this walk — it shows up on the next refresh.
+    for (const order of state.orders.filter((o) => o.id !== newcomer.id)) {
+      expect(screen.getAllByText(`${order.amount} ETH`, { exact: true }), order.id).toHaveLength(1);
+    }
+    expect(screen.getByText('12 ETH')).toBeInTheDocument();
+    expect(screen.queryByText('99 ETH')).not.toBeInTheDocument();
   });
 
-  test('falls back to the local cache when the coordinator request fails', async () => {
-    const localTx = {
-      id: 'local-only-order',
-      txHash: '0xlocalonlytx',
-      fromNetwork: 'ETH Sepolia',
-      toNetwork: 'Stellar Testnet',
-      fromToken: 'ETH',
-      toToken: 'XLM',
-      amount: '1',
-      estimatedAmount: '1',
-      status: 'pending',
-      timestamp: Date.now(),
-      direction: 'eth-to-xlm',
-    };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify([localTx]));
+  test('sends the coordinator cursor back verbatim', async () => {
+    const user = userEvent.setup();
+    render(<TransactionHistory ethAddress={ETH_ADDRESS} stellarAddress={STELLAR_ADDRESS} />);
 
-    const fetchMock = vi.fn(async () => {
-      throw new Error('network down');
-    });
-    vi.stubGlobal('fetch', fetchMock);
+    await waitFor(() => expect(loadMoreButton()).toBeInTheDocument());
+    await user.click(loadMoreButton()!);
+    await waitFor(() => expect(screen.getByText('6 ETH')).toBeInTheDocument());
 
-    render(<TransactionHistory ethAddress="0xEthAddress" />);
-
-    await waitFor(() => {
-      expect(screen.getByText('ETH Sepolia')).toBeInTheDocument();
-    });
-
-    // Cached local order still renders even though recovery failed.
-    expect(screen.getByText(/1 ETH/)).toBeInTheDocument();
+    // First request has no cursor; the second repeats the token the stub issued.
+    expect(state.requests[0].cursor).toBeUndefined();
+    expect(state.requests[1].cursor).toBe('order-05');
   });
 
-  test('does not query the coordinator when no wallet is connected', async () => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
+  test('refresh restarts from the newest page', async () => {
+    const user = userEvent.setup();
+    render(<TransactionHistory ethAddress={ETH_ADDRESS} stellarAddress={STELLAR_ADDRESS} />);
 
-    render(<TransactionHistory />);
+    await waitFor(() => expect(loadMoreButton()).toBeInTheDocument());
+    await user.click(loadMoreButton()!);
+    await waitFor(() => expect(screen.getByText('6 ETH')).toBeInTheDocument());
 
-    await waitFor(() => {
-      expect(screen.getByText('No transactions yet')).toBeInTheDocument();
-    });
-    expect(fetchMock).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: /refresh/i }));
+    await waitFor(() => expect(state.requests).toHaveLength(3));
+    expect(state.requests[2].cursor).toBeUndefined();
+  });
+});
+
+describe('TransactionHistory invalid cursor', () => {
+  test('shows the error and no partial silent page', async () => {
+    const user = userEvent.setup();
+    render(<TransactionHistory ethAddress={ETH_ADDRESS} stellarAddress={STELLAR_ADDRESS} />);
+
+    await waitFor(() => expect(loadMoreButton()).toBeInTheDocument());
+    state.rejectCursors.add('order-05');
+
+    await user.click(loadMoreButton()!);
+
+    const alert = await screen.findByRole('alert');
+    expect(within(alert).getByText(/cursor was issued for a different user/i)).toBeInTheDocument();
+
+    // The already-loaded page stays put — a rejected cursor must not read as a
+    // successful, merely short, final page.
+    for (const order of state.orders.slice(0, 5)) {
+      expect(screen.getAllByText(`${order.amount} ETH`, { exact: true }), order.id).toHaveLength(1);
+    }
+    expect(screen.queryByText('6 ETH')).not.toBeInTheDocument();
+    expect(loadMoreButton()).not.toBeInTheDocument();
+  });
+
+  test('surfaces a coordinator outage instead of an empty-looking history', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(503, { error: 'unavailable', message: 'Coordinator is down' }))
+    );
+
+    render(<TransactionHistory ethAddress={ETH_ADDRESS} stellarAddress={STELLAR_ADDRESS} />);
+
+    const alert = await screen.findByRole('alert');
+    expect(within(alert).getByText(/coordinator is down/i)).toBeInTheDocument();
   });
 });
 

@@ -14,6 +14,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
+import request from "supertest";
 import pino from "pino";
 import { resolve } from "node:path";
 import { mkdtempSync } from "node:fs";
@@ -21,6 +22,8 @@ import { tmpdir } from "node:os";
 import { openDatabase } from "../src/persistence/db.js";
 import { OrdersRepository } from "../src/persistence/orders-repo.js";
 import { OrderService, OrderValidationError } from "../src/services/order-service.js";
+import { createApp } from "../src/server/app.js";
+import type { SecretService } from "../src/services/secret-service.js";
 import {
   QuoteService,
   QuoteExpiredError,
@@ -49,6 +52,15 @@ const BASE_ANNOUNCE = {
   dstAmount:        "100000000",
 };
 
+const BASE_TERMS = {
+  srcChain: "ethereum" as const,
+  srcAsset: "native",
+  srcAmount: "1000000000000000000",
+  dstChain: "stellar" as const,
+  dstAsset: "native",
+  dstAmount: "100000000"
+};
+
 /** Returns a silent pino mock of CoinGecko that succeeds. */
 function mockCoingecko() {
   vi.stubGlobal("fetch", async () => ({
@@ -74,7 +86,7 @@ describe("QuoteService — quote lifecycle", () => {
     const svc = new QuoteService(log, now);
     mockCoingecko();
 
-    const q = await svc.quoteEthXlm();
+    const q = await svc.quoteEthXlm(BASE_TERMS);
 
     expect(q.quoteId).toMatch(/^[a-f0-9]{32}$/);
     expect(q.issuedAt).toBe(1_000_000);
@@ -88,7 +100,7 @@ describe("QuoteService — quote lifecycle", () => {
     const svc = new QuoteService(log);
     mockCoingecko();
 
-    const q = await svc.quoteEthXlm();
+    const q = await svc.quoteEthXlm(BASE_TERMS);
     expect(svc.getById(q.quoteId)).toMatchObject({ quoteId: q.quoteId });
   });
 
@@ -107,7 +119,7 @@ describe("QuoteService.assertFresh — fresh quote", () => {
     const svc = new QuoteService(log, now);
     mockCoingecko();
 
-    const q = await svc.quoteEthXlm();
+    const q = await svc.quoteEthXlm(BASE_TERMS);
 
     nowMs = 1_010_000; // +10 s, well within 30 s TTL
     const result = svc.assertFresh(q.quoteId);
@@ -124,7 +136,7 @@ describe("QuoteService.assertFresh — expired quote", () => {
     const svc = new QuoteService(log, now);
     mockCoingecko();
 
-    const q = await svc.quoteEthXlm();
+    const q = await svc.quoteEthXlm(BASE_TERMS);
 
     nowMs = q.expiresAt + 1; // one ms past the deadline
     expect(() => svc.assertFresh(q.quoteId)).toThrowError(QuoteExpiredError);
@@ -136,7 +148,7 @@ describe("QuoteService.assertFresh — expired quote", () => {
     const svc = new QuoteService(log, now);
     mockCoingecko();
 
-    const q = await svc.quoteEthXlm();
+    const q = await svc.quoteEthXlm(BASE_TERMS);
     nowMs = q.expiresAt + 5_000;
 
     let caught: QuoteExpiredError | undefined;
@@ -160,7 +172,7 @@ describe("QuoteService.assertFresh — boundary timestamp", () => {
     const svc = new QuoteService(log, now);
     mockCoingecko();
 
-    const q = await svc.quoteEthXlm();
+    const q = await svc.quoteEthXlm(BASE_TERMS);
 
     // Exact boundary — NOT expired
     nowMs = q.expiresAt;
@@ -195,11 +207,11 @@ describe("QuoteService.evictExpired", () => {
     const svc = new QuoteService(log, now);
     mockCoingecko();
 
-    const q1 = await svc.quoteEthXlm();
+    const q1 = await svc.quoteEthXlm(BASE_TERMS);
 
     // Advance past the price-cache TTL so quoteEthXlm fetches again
     nowMs = q1.expiresAt + 1;
-    const q2 = await svc.quoteEthXlm();
+    const q2 = await svc.quoteEthXlm(BASE_TERMS);
 
     // Advance past q2's expiry too
     nowMs = q2.expiresAt + 1;
@@ -216,7 +228,7 @@ describe("QuoteService.evictExpired", () => {
     const svc = new QuoteService(log, now);
     mockCoingecko();
 
-    const q = await svc.quoteEthXlm();
+    const q = await svc.quoteEthXlm(BASE_TERMS);
 
     nowMs = 1_005_000; // +5 s, inside 30 s TTL
     svc.evictExpired();
@@ -250,11 +262,18 @@ describe("OrderService.announce — quote freshness gate", () => {
     const quoteSvc  = new QuoteService(log, now);
     const orders    = new OrderService(new OrdersRepository(db), log, quoteSvc);
 
-    const q = await quoteSvc.quoteEthXlm();
+    const q = await quoteSvc.quoteEthXlm(BASE_TERMS);
 
     nowMs = 1_010_000; // still fresh
     const order = await orders.announce({ ...BASE_ANNOUNCE, quoteId: q.quoteId });
     expect(order.status).toBe("announced");
+    expect(quoteSvc.getById(q.quoteId)?.terms).toEqual({
+      fromAsset: BASE_ANNOUNCE.srcAsset,
+      toAsset: BASE_ANNOUNCE.dstAsset,
+      amount: BASE_ANNOUNCE.srcAmount,
+      fromNetwork: BASE_ANNOUNCE.srcChain,
+      toNetwork: BASE_ANNOUNCE.dstChain
+    });
   });
 
   it("rejects an order when quoteId references an expired quote", async () => {
@@ -266,7 +285,7 @@ describe("OrderService.announce — quote freshness gate", () => {
     const quoteSvc = new QuoteService(log, now);
     const orders   = new OrderService(new OrdersRepository(db), log, quoteSvc);
 
-    const q = await quoteSvc.quoteEthXlm();
+    const q = await quoteSvc.quoteEthXlm(BASE_TERMS);
 
     nowMs = q.expiresAt + 1; // past expiry
     await expect(
@@ -294,7 +313,7 @@ describe("OrderService.announce — quote freshness gate", () => {
     const repo     = new OrdersRepository(db);
     const orders   = new OrderService(repo, log, quoteSvc);
 
-    const q = await quoteSvc.quoteEthXlm();
+    const q = await quoteSvc.quoteEthXlm(BASE_TERMS);
     nowMs = q.expiresAt + 1;
 
     await expect(
@@ -318,5 +337,82 @@ describe("OrderService.announce — quote freshness gate", () => {
 
     const persisted = await repo.findByHashlock(VALID_HASHLOCK);
     expect(persisted).toBeNull();
+  });
+});
+
+describe("quote and order routes", () => {
+  async function routeHarness(now: () => number) {
+    const db = await freshDb();
+    const repo = new OrdersRepository(db);
+    const quoteSvc = new QuoteService(log, now);
+    const orders = new OrderService(repo, log, quoteSvc);
+    const app = createApp({
+      log,
+      corsOrigins: ["*"],
+      maxRequestBodyBytes: 65_536,
+      orders,
+      secrets: {} as SecretService,
+      quotes: quoteSvc
+    });
+    return { app, repo, quoteSvc };
+  }
+
+  async function issueRouteQuote(app: ReturnType<typeof createApp>) {
+    return request(app).get("/api/quotes/eth-xlm").query(BASE_TERMS);
+  }
+
+  it("creates one order from a fresh matching route quote", async () => {
+    mockCoingecko();
+    const { app, repo } = await routeHarness(() => 1_000_000);
+    const quoteResponse = await issueRouteQuote(app);
+
+    expect(quoteResponse.status).toBe(200);
+    expect(quoteResponse.body).toMatchObject(BASE_TERMS);
+
+    const orderResponse = await request(app)
+      .post("/api/orders/announce")
+      .send({ ...BASE_ANNOUNCE, quoteId: quoteResponse.body.quoteId });
+
+    expect(orderResponse.status).toBe(201);
+    expect(await repo.findByHashlock(VALID_HASHLOCK)).not.toBeNull();
+  });
+
+  it("rejects an expired route quote without creating an order", async () => {
+    mockCoingecko();
+    let nowMs = 1_000_000;
+    const { app, repo } = await routeHarness(() => nowMs);
+    const quoteResponse = await issueRouteQuote(app);
+    nowMs = quoteResponse.body.expiresAt + 1;
+
+    const orderResponse = await request(app)
+      .post("/api/orders/announce")
+      .send({ ...BASE_ANNOUNCE, quoteId: quoteResponse.body.quoteId });
+
+    expect(orderResponse.status).toBe(400);
+    expect(orderResponse.body.error).toBe("quote_expired");
+    expect(await repo.findByHashlock(VALID_HASHLOCK)).toBeNull();
+  });
+
+  it.each([
+    ["amount", { srcAmount: "2" }],
+    ["network", {
+      direction: "xlm_to_eth",
+      srcChain: "stellar",
+      srcAddress: VALID_STELLAR,
+      dstChain: "ethereum",
+      dstAddress: VALID_ETH_ADDR
+    }]
+  ])("rejects %s drift without creating an order", async (_kind, changedTerms) => {
+    mockCoingecko();
+    const { app, repo } = await routeHarness(() => 1_000_000);
+    const quoteResponse = await issueRouteQuote(app);
+
+    const orderResponse = await request(app)
+      .post("/api/orders/announce")
+      .send({ ...BASE_ANNOUNCE, ...changedTerms, quoteId: quoteResponse.body.quoteId });
+
+    expect(orderResponse.status).toBe(400);
+    expect(orderResponse.body.error).toBe("quote_mismatch");
+    expect(await repo.findByHashlock(VALID_HASHLOCK)).toBeNull();
   });
 });

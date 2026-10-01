@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { sha256, toHex } from "viem";
+import { describe, it, expect } from "vitest";
+import { hashOrderPreimage } from "@oversync/sdk/secrets";
 import pino from "pino";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,18 +18,8 @@ const log = pino({ level: "silent" });
 const VALID_ETH_ADDR = "0x1111111111111111111111111111111111111111";
 const VALID_STELLAR_ADDR = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB422";
 
-function hexToUint8(hex: string): Uint8Array {
-  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
-  const buf = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < buf.length; i++) {
-    buf[i] = parseInt(clean.substr(i * 2, 2), 16);
-  }
-  return buf;
-}
-
-function computeHashlock(preimage: string): string {
-  const bytes = hexToUint8(preimage);
-  return sha256(toHex(bytes));
+function computeHashlock(preimage: string, orderId = 1n): string {
+  return hashOrderPreimage(orderId, preimage as `0x${string}`);
 }
 
 async function freshDb() {
@@ -103,7 +93,7 @@ describe("SecretService – reused preimage rejection", () => {
       publicId: "order3",
       direction: "xlm_to_eth",
       status: "src_locked",
-      hashlock,
+      hashlock: computeHashlock(preimage, 3n),
       srcChain: "stellar",
       srcAddress: VALID_STELLAR_ADDR,
       srcAsset: "native",
@@ -154,7 +144,7 @@ describe("SecretService – reused preimage rejection", () => {
 
     // A duplicate relay resolves without rewriting the stored txHash.
     await expect(
-      secrets.reveal(order.publicId, preimage, "0xtx2")
+      secrets.reveal(order.publicId, preimage, "0xtx1")
     ).resolves.toEqual({ ok: true });
     const storedAfter = await orders.get(order.publicId);
     expect(storedAfter?.secretRevealedTx).toBe("0xtx1");
@@ -187,7 +177,7 @@ describe("SecretService – reused preimage rejection", () => {
       publicId: "order-lc",
       direction: "xlm_to_eth",
       status: "src_locked",
-      hashlock,
+      hashlock: computeHashlock(lowerCase, 2n),
       srcChain: "stellar",
       srcAddress: VALID_STELLAR_ADDR,
       srcAsset: "native",

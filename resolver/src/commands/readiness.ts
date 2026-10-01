@@ -21,7 +21,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { sepolia, mainnet } from "viem/chains";
 import { rpc, Keypair } from "@stellar/stellar-sdk";
 import { resolveEthereumRpcUrl } from "../ethereum-rpc-url.js";
-import { checkCoordinatorNetwork, redactUrl } from "../network-agreement.js";
+import { checkCoordinatorNetwork, checkResolverNetworkAgreement, redactUrl } from "../network-agreement.js";
 
 // Load .env from CWD. dotenv is a no-op if the file is missing, so this is
 // safe for tests and prod. Existing env vars take precedence over .env.
@@ -90,7 +90,19 @@ async function pingEvmRpc(network: "testnet" | "mainnet"): Promise<{
   chainId: number | null;
   detail: string;
 }> {
-  const url = resolveEthereumRpcUrl(network);
+  let url: string;
+  try {
+    url = resolveEthereumRpcUrl(network);
+  } catch (err: any) {
+    // Validation errors (credentials, empty host, network mismatch) are
+    // caught here so assessReadiness() always returns a ReadinessResult
+    // rather than propagating an uncaught exception.
+    return {
+      ok: false,
+      chainId: null,
+      detail: `RPC URL validation failed: ${err?.message ?? String(err)}`
+    };
+  }
   const displayUrl = redactRpcUrl(url);
   const chain = network === "mainnet" ? mainnet : sepolia;
   const expectedChainId = network === "mainnet" ? 1 : 11_155_111;
@@ -222,6 +234,28 @@ export async function assessReadiness(): Promise<ReadinessResult> {
     label: "Stellar / Soroban RPC reachable",
     status: sorobanPing.ok ? "ok" : "fail",
     detail: sorobanPing.detail
+  });
+
+  // ===== Resolver network agreement (EVM + Soroban match NETWORK_MODE) =====
+  const evmRpcUrl = resolveEthereumRpcUrl(network);
+  const sorobanRpcUrl =
+    process.env.SOROBAN_RPC_URL?.trim() ||
+    (network === "mainnet" ? "https://mainnet.sorobanrpc.com" : "https://soroban-testnet.stellar.org");
+  const sorobanNetworkPassphrase = network === "mainnet"
+    ? "Public Global Stellar Network ; September 2015"
+    : "Test SDF Network ; September 2015";
+
+  const resolverAgreement = await checkResolverNetworkAgreement(
+    network,
+    evmRpcUrl,
+    sorobanRpcUrl,
+    sorobanNetworkPassphrase
+  );
+  checks.push({
+    id: "resolver-network-agreement",
+    label: "Resolver EVM and Soroban networks agree with NETWORK_MODE",
+    status: resolverAgreement.status === "ok" ? "ok" : "fail",
+    detail: resolverAgreement.detail
   });
 
   const sorobanRegistry = process.env[sorobanRegistryEnv];

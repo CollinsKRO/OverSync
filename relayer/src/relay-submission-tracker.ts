@@ -400,6 +400,17 @@ export class RelayOrderBusyError extends RelayInFlightError {
   }
 }
 
+/** A deterministic refusal that must never be retried. */
+export class RelayRefusalError extends Error {
+  readonly code: string;
+
+  constructor(code: string) {
+    super(code);
+    this.name = 'RelayRefusalError';
+    this.code = code;
+  }
+}
+
 const DEFAULTS = {
   maxAttempts: 3,
   timeoutMs: 30_000,
@@ -713,16 +724,42 @@ export class RelaySubmissionTracker {
     return this.track(key, () => this.broadcastOnce(record, stager));
   }
 
-  /**
-   * Register the in-flight operation for a key so overlapping callers join it
-   * rather than starting a second one.
-   */
-  private track<R>(key: string, run: () => Promise<RelayOutcome<R>>): Promise<RelayOutcome<R>> {
-    const promise = run();
-    this.inflight.set(key, promise as Promise<RelayOutcome<unknown>>);
-    const clear = () => {
-      if (this.inflight.get(key) === (promise as Promise<RelayOutcome<unknown>>)) {
-        this.inflight.delete(key);
+      try {
+        const result = await withTimeout(
+          executor(),
+          this.cfg.timeoutMs,
+          `Relay ${key} timed out after ${this.cfg.timeoutMs}ms (attempt ${record.attempts}/${this.cfg.maxAttempts})`
+        );
+        record.status = 'succeeded';
+        record.result = result;
+        record.completedAt = this.cfg.now();
+        this.emit('success', record);
+        this.cfg.logger?.log?.(
+          `✅ Relay ${key} succeeded on attempt ${record.attempts}/${this.cfg.maxAttempts}`
+        );
+        return { status: 'succeeded', result, record, duplicate: false };
+      } catch (err) {
+        record.lastError = errorMessage(err);
+        const retryable = !(err instanceof RelayRefusalError) && this.cfg.isRetryable(err);
+        const budgetLeft = record.attempts < this.cfg.maxAttempts;
+
+        if (retryable && budgetLeft) {
+          this.emit('retry', record);
+          this.cfg.logger?.warn?.(
+            `⚠️  Relay ${key} attempt ${record.attempts}/${this.cfg.maxAttempts} failed: ${record.lastError}. Retrying...`
+          );
+          await this.cfg.sleep(this.delayFor(record.attempts));
+          continue;
+        }
+
+        // Non-retryable error, or retry budget exhausted → terminal failure.
+        record.status = 'failed';
+        record.completedAt = this.cfg.now();
+        this.emit('terminal_failure', record);
+        this.cfg.logger?.error?.(
+          `❌ Relay ${key} failed terminally after ${record.attempts}/${this.cfg.maxAttempts} attempt(s): ${record.lastError}`
+        );
+        throw new RelayTerminalError(key, record.attempts, record.lastError);
       }
     };
     promise.then(clear, clear);

@@ -48,3 +48,16 @@ export function createCorsMiddleware(
     credentials: true,
   });
 }
+
+export function createStrictCorsMiddleware(
+  allowedOrigins: string[]
+): RequestHandler {
+  return (req, res, next) => {
+    const origin = req.headers.origin;
+    if (!origin || !isOriginAllowed(origin, allowedOrigins)) {
+      res.status(403).json({ error: "origin_not_allowed" });
+      return;
+    }
+    next();
+  };
+}

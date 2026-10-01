@@ -1,5 +1,4 @@
-import { keccak256, sha256 } from "viem";
-import { assertValidSecretFormat } from "@oversync/sdk/secrets";
+import { hashOrderPreimage } from "@oversync/sdk/secrets";
 
 export type Hex = `0x${string}`;
 
@@ -8,12 +7,11 @@ export type OrderStatus = "Funded" | "Claimed" | "Refunded";
 export interface CreateOrderInput {
   hashlock: Hex;
   timelockSeconds: number;
-  /** Escrowed amount locked by the maker. Defaults to DEFAULT_ESCROW_AMOUNT. */
-  amount?: bigint;
-  /** Party that funds the order and receives it back on refund. */
-  maker?: string;
-  /** Party that receives the escrow on a successful claim. */
-  recipient?: string;
+  /**
+   * Address attempting the create. Required only when the registry gate
+   * is enabled; used to look the sender up in the active-resolver set.
+   */
+  sender?: string;
 }
 
 export interface OrderView {
@@ -53,7 +51,8 @@ export type SimErrorCode =
   | "OrderNotRefundable"
   | "InvalidPreimage"
   | "Expired"
-  | "NotExpired";
+  | "NotExpired"
+  | "ResolverNotAuthorised";
 
 export class SimError extends Error {
   constructor(public readonly code: SimErrorCode) {
@@ -68,13 +67,15 @@ export interface HtlcSim {
   claimOrder(id: bigint, preimage: Hex): void;
   refundOrder(id: bigint): void;
   getOrder(id: bigint): OrderView;
+  nextOrderId(): bigint;
   advanceTime(seconds: number): void;
-  /** Balance currently held by a party (maker/recipient) on this fixture. */
-  getBalance(party: string): bigint;
-  /** Escrow still locked against a specific order (0 once released). */
-  getEscrowBalanceFor(id: bigint): bigint;
-  /** Total escrow still locked across all orders on this fixture. */
-  getEscrowBalance(): bigint;
+  /**
+   * Mirrors `HTLCEscrow`'s optional `ResolverRegistry`: when enabled,
+   * only an active resolver may create an order. Claim and refund stay
+   * permissionless regardless of registry state.
+   */
+  setRegistryEnabled(enabled: boolean): void;
+  setResolverActive(resolver: string, active: boolean): void;
 }
 
 // Mirrors the [MIN_TIMELOCK, MAX_TIMELOCK] bounds enforced by both
@@ -90,6 +91,8 @@ abstract class BaseHtlcSim {
   protected readonly balances = new Map<string, bigint>();
   protected nextId = 1n;
   protected now: number;
+  private registryEnabled = false;
+  private readonly activeResolvers = new Set<string>();
 
   constructor() {
     this.now = Math.floor(Date.now() / 1000);
@@ -99,12 +102,22 @@ abstract class BaseHtlcSim {
     this.now += seconds;
   }
 
+  nextOrderId(): bigint {
+    return this.nextId;
+  }
+
   createOrder(input: CreateOrderInput): bigint {
     if (!/^0x[0-9a-fA-F]{64}$/.test(input.hashlock) || /^0x0+$/.test(input.hashlock)) {
       throw new SimError("InvalidHashlock");
     }
     if (input.timelockSeconds < MIN_TIMELOCK || input.timelockSeconds > MAX_TIMELOCK) {
       throw new SimError("InvalidTimelock");
+    }
+    if (this.registryEnabled) {
+      const sender = input.sender?.toLowerCase();
+      if (!sender || !this.activeResolvers.has(sender)) {
+        throw new SimError("ResolverNotAuthorised");
+      }
     }
     const id = this.nextId++;
     const amount = input.amount ?? DEFAULT_ESCROW_AMOUNT;
@@ -180,11 +193,7 @@ abstract class BaseHtlcSim {
 }
 
 /**
- * Faithful re-encoding of HTLCEscrow.sol's claim/refund branch logic.
- * The contract accepts a preimage if EITHER sha256(preimage) OR
- * keccak256(preimage) equals the stored hashlock, which is how a
- * single hashlock can interop with Soroban (sha256-only) and classic
- * keccak-flavoured EVM counterparties.
+ * Faithful re-encoding of HTLCEscrow.sol's order-bound claim logic.
  */
 export class EvmHtlcSim extends BaseHtlcSim implements HtlcSim {
   readonly name = "evm" as const;
@@ -193,14 +202,10 @@ export class EvmHtlcSim extends BaseHtlcSim implements HtlcSim {
     const o = this.getMutable(id);
     if (o.status !== "Funded") throw new SimError("OrderNotClaimable");
     if (this.now > o.timelockAbsolute) throw new SimError("Expired");
-    try {
-      assertValidSecretFormat(preimage, "preimage");
-    } catch {
+    if (!/^0x(?:[0-9a-fA-F]{2})+$/.test(preimage)) {
       throw new SimError("InvalidPreimage");
     }
-    const sha = sha256(preimage);
-    const kek = keccak256(preimage);
-    if (sha !== o.hashlock && kek !== o.hashlock) {
+    if (hashOrderPreimage(id, preimage) !== o.hashlock) {
       throw new SimError("InvalidPreimage");
     }
     o.status = "Claimed";
@@ -212,8 +217,7 @@ export class EvmHtlcSim extends BaseHtlcSim implements HtlcSim {
 
 /**
  * Faithful re-encoding of the Soroban oversync-htlc claim branch. The
- * Soroban contract accepts a preimage only when sha256(preimage) equals
- * the stored hashlock — keccak256 is not consulted.
+ * Soroban contract uses the same order-bound SHA-256 hashlock as EVM.
  */
 export class SorobanHtlcSim extends BaseHtlcSim implements HtlcSim {
   readonly name = "soroban" as const;
@@ -222,13 +226,10 @@ export class SorobanHtlcSim extends BaseHtlcSim implements HtlcSim {
     const o = this.getMutable(id);
     if (o.status !== "Funded") throw new SimError("OrderNotClaimable");
     if (this.now > o.timelockAbsolute) throw new SimError("Expired");
-    try {
-      assertValidSecretFormat(preimage, "preimage");
-    } catch {
+    if (!/^0x(?:[0-9a-fA-F]{2})+$/.test(preimage)) {
       throw new SimError("InvalidPreimage");
     }
-    const sha = sha256(preimage);
-    if (sha !== o.hashlock) {
+    if (hashOrderPreimage(id, preimage) !== o.hashlock) {
       throw new SimError("InvalidPreimage");
     }
     o.status = "Claimed";
