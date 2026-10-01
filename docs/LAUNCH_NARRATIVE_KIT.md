@@ -189,7 +189,7 @@ These drafts are ready to publish or adapt. All claims trace to §3 above.
 > Ronin ($625M), Wormhole ($325M), Multichain ($231M) all failed this way.
 
 **Tweet 4 / 5**
-> OverSync's trust model: sha256(preimage) on-chain.
+> OverSync's trust model: SHA-256(order ID || preimage) on-chain on both chains.
 >
 > No validator quorum can redirect your funds. The contract has two exit paths: correct preimage → beneficiary. Timelock expires → you.
 >

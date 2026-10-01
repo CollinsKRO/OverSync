@@ -28,7 +28,7 @@ export interface CreateOrderInput {
   /** Amount in atomic units (wei for ETH, token decimals otherwise). */
   amount: bigint;
   safetyDeposit: bigint;
-  /** 32-byte digest, sha256(preimage) or keccak256(preimage). */
+  /** 32-byte digest from hashOrderPreimage(nextOrderId, preimage). */
   hashlock: Hex;
   /** Timelock duration in seconds (added to block.timestamp). */
   timelockSeconds: bigint;

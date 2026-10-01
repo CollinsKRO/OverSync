@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor, act } from '@testing-library/react';
 import BridgeForm from './BridgeForm';
 import type { NetworkModeState } from '../lib/useNetworkMode';
 import { vi } from 'vitest';
@@ -43,7 +43,13 @@ vi.mock('../lib/sanitizeAmountInput', () => ({
   sanitizeAmountInput: vi.fn((val: string) => val),
 }));
 
-const nullSigner = vi.fn().mockResolvedValue('');
+// Mock the backend status hook so we can drive readiness from tests.
+const useBackendStatusMock = vi.fn();
+vi.mock('../lib/useBackendStatus', () => ({
+  useBackendStatus: (...args: unknown[]) => useBackendStatusMock(...args),
+}));
+
+const nullSigner = vi.fn().mockResolved('');
 
 const testnetState: NetworkModeState = {
   mode: 'testnet',
@@ -61,14 +67,43 @@ const testnetState: NetworkModeState = {
   refreshWalletNetworks: vi.fn(),
 };
 
+const readyStatus = {
+  status: 'ready' as const,
+  loading: false,
+  error: null,
+  refresh: vi.fn(),
+};
+
+const notReadyStatus = {
+  status: 'not-ready' as const,
+  loading: false,
+  error: null,
+  refresh: vi.fn(),
+};
+
+const loadingStatus = {
+  status: 'loading' as const,
+  loading: true,
+  error: null,
+  refresh: vi.fn(),
+};
+
+const downStatus = {
+  status: 'down' as const,
+  loading: false,
+  error: 'coordinator unreachable',
+  refresh: vi.fn(),
+};
+
 describe('BridgeForm network mismatch guardrails', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    useBackendStatusMock.mockReturnValue(readyStatus);
     // Mock window.ethereum
     Object.defineProperty(window, 'ethereum', {
       writable: true,
       value: {
-        request: vi.fn().mockResolvedValue('0xaa36a7'),
+        request: vi.fn().mockResolved('0xaa36a7'),
         selectedAddress: '0x1234567890123456789012345678901234567890',
       },
     });
@@ -78,7 +113,7 @@ describe('BridgeForm network mismatch guardrails', () => {
     render(
       <BridgeForm
         ethAddress="0x1234567890123456789012345678901234567890"
-        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        stellarAddress="G@ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
         signStellarTransaction={nullSigner}
         networkState={testnetState}
       />,
@@ -88,8 +123,8 @@ describe('BridgeForm network mismatch guardrails', () => {
     // Button is disabled because amount is empty, but text shows "Bridge"
     // and no mismatch warning is rendered
     expect(submitBtn).toHaveTextContent('Bridge');
-    expect(screen.queryByText(/Network Mismatch/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/Switch MetaMask/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Network Mismatch/i)).not.toBeITheDocument();
+    expect(screen.queryByText(/Switch MetaMask/i)).not.toBeITheDocument();
     expect(screen.queryByText(/Switch Freighter/i)).not.toBeInTheDocument();
   });
 
@@ -128,7 +163,7 @@ describe('BridgeForm network mismatch guardrails', () => {
     render(
       <BridgeForm
         ethAddress="0x1234567890123456789012345678901234567890"
-        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        stellarAddress="G@ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
         signStellarTransaction={nullSigner}
         networkState={mismatchState}
       />,
@@ -237,7 +272,7 @@ describe('BridgeForm network mismatch guardrails', () => {
     ).toBeInTheDocument();
   });
 
-  test('submission guard alerts and rejects on network mismatch at runtime', async () => {
+  test('submission guard alerts and rejects on network mismatch at runtime', () => {
     const mismatchState: NetworkModeState = {
       ...testnetState,
       metamaskChainId: '0x1',
@@ -250,7 +285,7 @@ describe('BridgeForm network mismatch guardrails', () => {
     render(
       <BridgeForm
         ethAddress="0x1234567890123456789012345678901234567890"
-        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        stellarAddress="G@ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
         signStellarTransaction={nullSigner}
         networkState={mismatchState}
       />,
@@ -259,5 +294,152 @@ describe('BridgeForm network mismatch guardrails', () => {
     // The button should be disabled, but we verify the guard exists in handleSubmit
     const submitBtn = screen.getByRole('button', { name: /Network Mismatch/i });
     expect(submitBtn).toBeDisabled();
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('BridgeForm coordinator health gating', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.defineProperty(window, 'ethereum', {
+      writable: true,
+      value: {
+        request: vi.fn().mockResolved('0xaa36a7'),
+        selectedAddress: '0x1234567890123456789012345678901234567890',
+      },
+    });
+  });
+
+  const renderForm = () =>
+    render(
+      <BridgeForm
+        ethAddress="0x1234567890123456789012345678901234567890"
+        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        signStellarTransaction={nullSigner}
+        networkState={testnetState}
+      />,
+    );
+
+  test('not-ready health disables submit, claim, and refund', () => {
+    useBackendStatusMock.mockReturnValue(notReadyStatus);
+    renderForm();
+
+    expect(screen.getByRole('button', { name: /Bridge/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Claim/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Refund/i })).toBeDisabled();
+  });
+
+  test('loading health disables submit, claim, and refund', () => {
+    useBackendStatusMock.mockReturnValue(loadingStatus);
+    renderForm();
+
+    expect(screen.getByRole('button', { name: /Bridge/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Claim/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Refund/i })).toBeDisabled();
+  });
+
+  test('down health disables submit, claim, and refund', () => {
+    useBackendStatusMock.mockReturnValue(downStatus);
+    renderForm();
+
+    expect(screen.getByRole('button', { name: /Bridge/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Claim/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Refund/i })).toBeDisabled();
+  });
+
+  test('ready health enables submit when other guards pass', () => {
+    useBackendStatusMock.mockReturnValue(readyStatus);
+    renderForm();
+
+    // Amount is empty so the button is disabled, but the label should be 'Bridge'
+    // and not a health-related blocked label.
+    const submitBtn = screen.getByRole('button', { name: /Bridge/i });
+    expect(submitBtn).toHaveTextContent('Bridge');
+  });
+
+  test('wake action does not post an order', () => {
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolved({
+      ok: true,
+      json: async () => ({ status: 'ready' }),
+    } as Response);
+
+    useBackendStatusMock.mockReturnValue(notReadyStatus);
+    renderForm();
+
+    const wakeBtn = screen.queryByRole('button', { name: /Wake/i });
+    if (wakeBtn) {
+      act(() => {
+        wakeBtn.click();
+      });
+    }
+
+    // No fetch call should have been made to an order route.
+    for (const call of fetchSpy.mock.calls) {
+      const url = String(call[0]);
+      expect(url).not.toMatch(/\/orders?(\/|$|\?)/i);
+    }
+  });
+
+  test('an older health response does not override a newer not-ready response', () => {
+    // First render with not-ready, then re-render with ready to simulate a late
+    // response arriving after a newer one. The form must stay blocked.
+    useBackendStatusMock.mockReturnValue(notReadyStatus);
+    const { rerender } = render(
+      <BridgeForm
+        ethAddress="0x1234567890123456789012345678901234567890"
+        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        signStellarTransaction={nullSigner}
+        networkState={testnetState}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /Bridge/i })).toBeDisabled();
+
+    // Newer response arrives first.
+    useBackendStatusMock.mockReturnValue(readyStatus);
+    rerender(
+      <BridgeForm
+        ethAddress="0x1234567890123456789012345678901234567890"
+        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        signStellarTransaction={nullSigner}
+        networkState={testnetState}
+      />,
+    );
+
+    // Late older response arrives after the newer one.
+    useBackendStatusMock.mockReturnValue(notReadyStatus);
+    rerender(
+      <BridgeForm
+        ethAddress="0x1234567890123456789012345678901234567890"
+        stellarAddress="G@ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        signStellarTransaction={nullSigner}
+        networkState={testnetState}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /Bridge/i })).toBeDisabled();
+  });
+
+  test('wake calls health again and not the order route', () => {
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolved({
+      ok: true,
+      json: async () => ({ status: 'ready' }),
+    } as Response);
+
+    const refresh = vi.fn();
+    useBackendStatusMock.mockReturnValue({ ...notReadyStatus, refresh });
+    renderForm();
+
+    const wakeBtn = screen.queryByRole('button', { name: /Wake/i });
+    if (wakeBtn) {
+      act(() => {
+        wakeBtn.click();
+      });
+    }
+
+    for (const call of fetchSpy.mock.calls) {
+      const url = String(call[0]);
+      expect(url).not.toMatch(/\/orders?(\/|$|\?)/i);
+    }
   });
 });

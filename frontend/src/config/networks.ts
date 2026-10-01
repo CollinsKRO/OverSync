@@ -129,6 +129,13 @@ export const STELLAR_NETWORKS: Record<string, StellarNetworkConfig> = {
   },
 };
 
+export const STELLAR_MAINNET_PASSPHRASE = STELLAR_NETWORKS.mainnet.networkPassphrase;
+export const STELLAR_TESTNET_PASSPHRASE = STELLAR_NETWORKS.testnet.networkPassphrase;
+
+export function getExpectedStellarPassphrase(mode: AppNetworkMode): string {
+  return mode === 'mainnet' ? STELLAR_MAINNET_PASSPHRASE : STELLAR_TESTNET_PASSPHRASE;
+}
+
 export const CONTRACT_ADDRESSES = {
   ethereum: {
     mainnet: {

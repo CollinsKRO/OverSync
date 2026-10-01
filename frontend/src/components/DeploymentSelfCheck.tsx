@@ -1,6 +1,15 @@
 import { CheckCircle2, AlertTriangle, XCircle, Shield } from 'lucide-react'
 import { isMainnetEnabled, isTestnet, getCurrentNetwork, getContractAddresses } from '../config/networks'
 import { resolveViteSepoliaRpcUrl, resolveViteMainnetRpcUrl } from '../config/rpc-urls'
+import { getDeploymentRecord, type DeploymentRecord } from '../config/deployment'
+
+/**
+ * The deployment record the self-check reports. The Diligence Snapshot
+ * compares itself against this and hides on any disagreement.
+ */
+export function getSelfCheckDeploymentRecord(): DeploymentRecord {
+  return getDeploymentRecord()
+}
 
 type CheckStatus = 'pass' | 'warn' | 'fail'
 
@@ -57,6 +66,17 @@ function checkResults(): CheckResult[] {
     label: 'Contract IDs',
     status: hasPlaceholderContracts ? 'warn' : 'pass',
     detail: isTestnet() ? 'Testnet contracts configured' : 'Mainnet contracts active'
+  })
+
+  // Shared deployment record (same record the Diligence Snapshot renders)
+  const record = getSelfCheckDeploymentRecord()
+  const recordComplete = Boolean(
+    record.network && record.ethereum.escrow && record.ethereum.registry && record.stellar.escrow && record.stellar.registry
+  )
+  results.push({
+    label: 'Deployment record',
+    status: recordComplete ? 'pass' : 'warn',
+    detail: recordComplete ? `${record.network} escrow + registry recorded` : 'Incomplete deployment record'
   })
 
   // Explorer URLs

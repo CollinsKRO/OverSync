@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, test, expect } from "vitest";
 import { RefundTimelineSimulator } from "./RefundTimelineSimulator";
 
@@ -32,6 +33,14 @@ describe("RefundTimelineSimulator", () => {
   test("defaults to the claimable example", () => {
     render(<RefundTimelineSimulator />);
     expect(screen.getByText("Claimable")).toBeInTheDocument();
+  });
+
+  test("reports refundable only for a scenario with both chain timers expired", async () => {
+    render(<RefundTimelineSimulator />);
+    await userEvent.click(screen.getByRole("button", { name: "ETH → XLM — Refundable" }));
+
+    expect(screen.getByText("Refundable")).toBeInTheDocument();
+    expect(screen.getByText(/Both chain timelocks have expired/i)).toBeInTheDocument();
   });
 
   test("displays timelock expiry sections", () => {

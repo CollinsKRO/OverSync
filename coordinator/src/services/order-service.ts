@@ -4,20 +4,40 @@ import {
   OrdersRepository,
   type OrderRow,
   type OrderSnapshot,
+  type OrderRejectedTransition,
   type AnnounceOrderInput,
   type OrderMetrics,
   type OrderTransitionSummary,
   type Direction,
-  type Chain
+  type Chain,
+  type OrderStatus
 } from "../persistence/orders-repo.js";
-import { canTransition } from "../state-machine/order-machine.js";
-import { ordersTotal } from "../metrics.js";
+import {
+  ACTION_TARGET_STATUS,
+  ORDER_FAILURE_CODES,
+  actionForStatus,
+  describeTransitionFailure,
+  evaluateTransition,
+  type OrderFailureCode,
+  type OrderTransitionAction
+} from "../state-machine/order-machine.js";
+import { illegalOrderTransitions, ordersTotal } from "../metrics.js";
 import { QuoteService, QuoteExpiredError, QuoteNotFoundError } from "./quote-service.js";
 import { loadConfig } from "../config.js";
 import {
   validateTimelocksAtCreation,
   type TimelockValidationError
 } from "../utils/timelock-validator.js";
+
+/**
+ * Minimal interface the coordinator uses to verify that an Ethereum
+ * address is currently registered in the on-chain ResolverRegistry.
+ * Kept as a port so the service layer stays free of ethers / viem.
+ */
+export interface ResolverRegistryPort {
+  /** Returns true if `address` is currently active in the registry. */
+  isActive(address: string): Promise<boolean>;
+}
 
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_HASHLOCK = "0x" + "0".repeat(64);
@@ -53,8 +73,14 @@ export const announceSchema = z.object({
 
 export type AnnounceInput = z.infer<typeof announceSchema>;
 
+/**
+ * Codes an `OrderValidationError` can carry: the timelock ordering codes and
+ * the stable order state machine failure codes.
+ */
+export type OrderErrorCode = TimelockValidationError | OrderFailureCode;
+
 export class OrderValidationError extends Error {
-  readonly code?: TimelockValidationError;
+  readonly code?: OrderErrorCode;
 
   constructor(message: string, code?: TimelockValidationError) {
     super(message);
@@ -86,6 +112,50 @@ export class StaleOrderEventError extends OrderValidationError {
   }
 }
 
+export interface TransitionRejectionInfo {
+  from: OrderStatus;
+  to: OrderStatus;
+  action: OrderTransitionAction | null;
+  code: OrderFailureCode;
+  reason: string;
+  writer: string;
+  publicId: string;
+  txHash?: string | null;
+}
+
+/**
+ * Thrown when a writer asks the coordinator to move an order along an edge the
+ * state machine refuses. The attempt has already been persisted as a refused
+ * transition at this point and the stored status is untouched.
+ *
+ * It extends `StaleOrderEventError` because a late chain event is exactly what
+ * a rejected transition usually is, and existing callers rely on that.
+ */
+export class OrderTransitionRejectedError extends StaleOrderEventError {
+  readonly code: OrderFailureCode;
+  readonly from: OrderStatus;
+  readonly to: OrderStatus;
+  readonly action: OrderTransitionAction | null;
+  readonly writer: string;
+  readonly publicId: string;
+
+  constructor(info: TransitionRejectionInfo) {
+    super(info.reason);
+    this.name = "OrderTransitionRejectedError";
+    this.code = info.code;
+    this.from = info.from;
+    this.to = info.to;
+    this.action = info.action;
+    this.writer = info.writer;
+    this.publicId = info.publicId;
+  }
+}
+
+/** True when the error is a refusal produced by the order state machine. */
+export function isTransitionRejection(err: unknown): err is OrderTransitionRejectedError {
+  return err instanceof OrderTransitionRejectedError;
+}
+
 function validateChainAddress(chain: Chain, addr: string): void {
   if (chain === "ethereum" && !HEX_ADDRESS.test(addr)) {
     throw new OrderValidationError(`${addr} is not a valid Ethereum address`);
@@ -108,38 +178,47 @@ function validateDirectionAgainstChains(input: AnnounceInput): void {
   }
 }
 
-export class OrderService {
-  private readonly minGapSeconds: number;
+/**
+ * One request to move an order along one legal edge.
+ *
+ * `advance()` is the only place the coordinator writes order status, so the
+ * rule that decides whether an edge is legal (the state machine) is applied to
+ * every writer: the order service itself, the HTTP routes that call it, the
+ * secret service and both chain listeners.
+ */
+interface AdvanceRequest {
+  publicId: string;
+  action: OrderTransitionAction;
+  txHash?: string | null;
+  writer?: string;
+  /**
+   * When the order is already in the target status: does the incoming event
+   * carry exactly the payload that is already stored? Identical payloads are
+   * treated as an idempotent redelivery, anything else as a conflict.
+   */
+  isSameStep?: (order: OrderRow) => boolean;
+  logMessage: string;
+  logFields?: Record<string, unknown>;
+  apply: (order: OrderRow, to: OrderStatus) => Promise<void>;
+}
 
   constructor(
     private readonly repo: OrdersRepository,
     private readonly log: Logger,
     /** Optional — when supplied, quoteId in announce requests is validated. */
     private readonly quoteService?: QuoteService,
-    config?: ReturnType<typeof loadConfig>
+    config?: ReturnType<typeof loadConfig>,
+    /** Optional — when supplied, buildClaim validates resolver registration. */
+    private readonly resolverRegistry?: ResolverRegistryPort
   ) {
     this.minGapSeconds = config?.timelockSafetyGapSeconds ?? 600;
   }
 
-  /**
-   * Record a new order announcement. The coordinator does NOT lock any
-   * funds — it simply records the intent so the order book is visible
-   * to all resolvers and the user can later attach the on-chain
-   * `srcOrderId` once they have locked.
-   *
-   * When `quoteId` is present in the input, it is validated against
-   * the QuoteService before the order is persisted.  Expired or
-   * unknown quoteIds are rejected as `OrderValidationError` so the
-   * error surfaces cleanly to the caller before any chain action is
-   * attempted.
-   */
-  async announce(input: AnnounceInput): Promise<OrderRow> {
-    validateChainAddress(input.srcChain, input.srcAddress);
-    validateChainAddress(input.dstChain, input.dstAddress);
-    validateDirectionAgainstChains(input);
+  async buildLockOrder(request: LockRequest): Promise<any> {
+    const activeV2Escrow = this.config.getActiveV2Escrow();
 
-    if (input.hashlock.toLowerCase() === ZERO_HASHLOCK.toLowerCase()) {
-      throw new OrderValidationError("hashlock must not be all zeros");
+    if (activeV2Escrow && activeV2Escrow.toLowerCase() !== request.target.toLowerCase()) {
+      throw new Error("Legacy bridge lock rejected: v2 escrow active");
     }
 
     const hashlock = input.hashlock.toLowerCase() as `0x${string}`;
@@ -151,7 +230,13 @@ export class OrderService {
         this.log.debug({ quoteId: input.quoteId }, "quoteId supplied but no QuoteService wired; skipping freshness check");
       } else {
         try {
-          this.quoteService.assertFresh(input.quoteId);
+          this.quoteService.bindOrderTerms(input.quoteId, {
+            fromAsset: input.srcAsset,
+            toAsset: input.dstAsset,
+            amount: input.srcAmount,
+            fromNetwork: input.srcChain,
+            toNetwork: input.dstChain
+          });
           this.log.debug({ quoteId: input.quoteId }, "quote freshness confirmed");
         } catch (err) {
           if (err instanceof QuoteExpiredError || err instanceof QuoteNotFoundError) {
@@ -209,37 +294,53 @@ export class OrderService {
     return this.repo.findByPreimage(preimage);
   }
 
+  /** Match an on-chain id that belongs to the order's source leg. */
+  findBySrcOrderId(chain: Chain, orderId: string): Promise<OrderRow | null> {
+    return this.repo.findBySrcOrderId(chain, orderId);
+  }
+
+  /** Match an on-chain id that belongs to the order's destination leg. */
+  findByDstOrderId(chain: Chain, orderId: string): Promise<OrderRow | null> {
+    return this.repo.findByDstOrderId(chain, orderId);
+  }
+
+  /** Source leg escrowed on chain (`escrow` edge). */
   async recordSrcLock(input: {
     publicId: string;
     orderId: string;
     txHash: string;
     blockNumber: number;
     timelock: number;
+    writer?: string;
   }): Promise<void> {
-    const order = await this.repo.findByPublicId(input.publicId);
-    if (!order) throw new OrderValidationError(`unknown order ${input.publicId}`);
-    if (order.status === "src_locked") {
-      const sameEvent =
+    await this.advance({
+      publicId: input.publicId,
+      action: "escrow",
+      txHash: input.txHash,
+      writer: input.writer,
+      isSameStep: (order) =>
         order.srcOrderId === input.orderId &&
         order.srcLockTx === input.txHash &&
         order.srcLockBlock === input.blockNumber &&
-        order.srcTimelock === input.timelock;
-      if (sameEvent) return;
-      throw new StaleOrderEventError(`conflicting src lock event for ${input.publicId}`);
-    }
-    if (!canTransition(order.status, "src_locked")) {
-      throw new StaleOrderEventError(`stale src lock event for order in status ${order.status}`);
-    }
-
-    if (order.dstTimelock != null) {
-      assertTimelocksAtCreation(input.timelock, order.dstTimelock, this.minGapSeconds);
-    }
-
-    await this.repo.recordSrcLock(input);
-    this.log.info({ publicId: input.publicId, srcOrderId: input.orderId }, "src lock recorded");
-    ordersTotal.inc({ status: "src_locked" });
+        order.srcTimelock === input.timelock,
+      logMessage: "src lock recorded",
+      logFields: { srcOrderId: input.orderId },
+      apply: async (order) => {
+        if (order.dstTimelock != null) {
+          assertTimelocksAtCreation(input.timelock, order.dstTimelock, this.minGapSeconds);
+        }
+        await this.repo.recordSrcLock({
+          publicId: input.publicId,
+          orderId: input.orderId,
+          txHash: input.txHash,
+          blockNumber: input.blockNumber,
+          timelock: input.timelock
+        });
+      }
+    });
   }
 
+  /** Destination leg locked by a resolver (`secret_relay` edge). */
   async recordDstLock(input: {
     publicId: string;
     orderId: string;
@@ -247,37 +348,44 @@ export class OrderService {
     blockNumber: number;
     timelock: number;
     resolver: string | null;
+    writer?: string;
   }): Promise<void> {
-    const order = await this.repo.findByPublicId(input.publicId);
-    if (!order) throw new OrderValidationError(`unknown order ${input.publicId}`);
-    if (order.status === "dst_locked") {
-      const sameEvent =
+    await this.advance({
+      publicId: input.publicId,
+      action: "secret_relay",
+      txHash: input.txHash,
+      writer: input.writer,
+      isSameStep: (order) =>
         order.dstOrderId === input.orderId &&
         order.dstLockTx === input.txHash &&
         order.dstLockBlock === input.blockNumber &&
         order.dstTimelock === input.timelock &&
-        order.resolverAddress === input.resolver;
-      if (sameEvent) return;
-      throw new StaleOrderEventError(`conflicting dst lock event for ${input.publicId}`);
-    }
-    if (!canTransition(order.status, "dst_locked")) {
-      throw new StaleOrderEventError(`stale dst lock event for order in status ${order.status}`);
-    }
-
-    if (order.srcTimelock != null) {
-      assertTimelocksAtCreation(order.srcTimelock, input.timelock, this.minGapSeconds);
-    }
-
-    await this.repo.recordDstLock(input);
-    this.log.info({ publicId: input.publicId, dstOrderId: input.orderId }, "dst lock recorded");
-    ordersTotal.inc({ status: "dst_locked" });
+        order.resolverAddress === input.resolver,
+      logMessage: "dst lock recorded",
+      logFields: { dstOrderId: input.orderId },
+      apply: async (order) => {
+        if (order.srcTimelock != null) {
+          assertTimelocksAtCreation(order.srcTimelock, input.timelock, this.minGapSeconds);
+        }
+        await this.repo.recordDstLock({
+          publicId: input.publicId,
+          orderId: input.orderId,
+          txHash: input.txHash,
+          blockNumber: input.blockNumber,
+          timelock: input.timelock,
+          resolver: input.resolver
+        });
+      }
+    });
   }
 
   async recordSecret(publicId: string, preimage: string, txHash: string): Promise<void> {
     const order = await this.repo.findByPublicId(publicId);
     if (!order) throw new OrderValidationError(`unknown order ${publicId}`);
     if (order.status === "secret_revealed") {
-      if (order.preimage === preimage && order.secretRevealedTx === txHash) return;
+      // Idempotent: same preimage for the same order is always accepted,
+      // even if the txHash differs (e.g. a second chain event observer).
+      if (order.preimage === preimage) return;
       throw new StaleOrderEventError(`conflicting secret event for ${publicId}`);
     }
     if (!canTransition(order.status, "secret_revealed")) {
@@ -292,18 +400,79 @@ export class OrderService {
     return this.repo.getMetrics();
   }
 
-  async markStatus(publicId: string, status: OrderRow["status"]): Promise<void> {
-    const order = await this.repo.findByPublicId(publicId);
-    if (!order) throw new OrderValidationError(`unknown order ${publicId}`);
-    if (!canTransition(order.status, status)) {
-      throw new OrderValidationError(`cannot transition from ${order.status} to ${status}`);
+  async markStatus(publicId: string, status: OrderStatus, writer?: string): Promise<void> {
+    const action = actionForStatus(status);
+    if (action === null) {
+      throw new OrderValidationError(`${status} is not the target of a lifecycle edge`);
     }
-    await this.repo.setStatus(publicId, status);
-    this.log.info({ publicId, status }, "status updated");
-    ordersTotal.inc({ status });
+    await this.advance({
+      publicId,
+      action,
+      writer,
+      logMessage: "status updated",
+      apply: async () => {
+        await this.repo.setStatus(publicId, status);
+      }
+    });
   }
 
   async getSnapshots(): Promise<OrderSnapshot[]> {
     return this.repo.getCompletedOrderSnapshots();
   }
+
+  /**
+   * Validate that the coordinator may build a claim transaction for
+   * `orderId` on behalf of `resolverAddress`.
+   *
+   * Throws `OrderValidationError` when:
+   *  - The order does not exist or is not in a claimable state.
+   *  - The resolver registry is configured and the resolver address is
+   *    not currently active (never registered, or removed).
+   *
+   * Returns the order row so the caller can assemble the transaction
+   * without a second DB round-trip.
+   */
+  async buildClaim(orderId: string, resolverAddress: string): Promise<OrderRow> {
+    const order = await this.repo.findByPublicId(orderId);
+    if (!order) throw new OrderValidationError(`unknown order ${orderId}`);
+
+    if (order.status !== "dst_locked") {
+      throw new OrderValidationError(
+        `order ${orderId} is not in dst_locked state (current: ${order.status})`
+      );
+    }
+
+    if (this.resolverRegistry) {
+      const active = await this.resolverRegistry.isActive(resolverAddress);
+      if (!active) {
+        throw new OrderValidationError(
+          `resolver ${resolverAddress} is not registered or has been removed from the registry`
+        );
+      }
+      this.log.debug({ orderId, resolverAddress }, "resolver registry check passed");
+    }
+
+    return order;
+  }
+}
+
+export class LegacyLockError extends Error {
+  constructor() {
+    super("legacy lock refused");
+    this.name = "LegacyLockError";
+  }
+}
+
+/** Use the v2 escrow when it is configured. A legacy-bridge target builds nothing. */
+export function resolveLockTarget(input: {
+  v2Escrow?: string | null;
+  requestedTarget: string;
+  legacyBridge: string;
+}): { target: string } {
+  const v2 = (input.v2Escrow ?? "").trim();
+  if (!v2) return { target: input.requestedTarget };
+  if (input.requestedTarget.toLowerCase() === input.legacyBridge.toLowerCase()) {
+    throw new LegacyLockError();
+  }
+  return { target: v2 };
 }

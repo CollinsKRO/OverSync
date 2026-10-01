@@ -235,3 +235,80 @@ export function observedFromSorobanEvent(e: {
 }
 
 export { validateResolverConfig, validateDestinationParams } from "./validate.js";
+
+// ---------------------------------------------------------------------------
+// Order-drift validation (issue #265)
+//
+// The dry-run planner above builds a fill plan. This half of the planner
+// checks a plan against the canonical coordinator order — hashlock, both
+// timelocks, amount, and asset — and must be re-run at the submit
+// boundary so a plan that drifted or expired is never handed to a
+// listener.
+// ---------------------------------------------------------------------------
+
+import type {
+  PlanAction,
+  PlanLeg,
+  ResolverOrder,
+  ResolverPlan
+} from "./validate.js";
+
+export {
+  PlanErrorCode,
+  PlanValidationError,
+  submitValidatedPlan,
+  validatePlan,
+  validatePlanForSubmit
+} from "./validate.js";
+export type {
+  Chain,
+  PlanAction,
+  PlanErrorCodeValue,
+  PlanIssue,
+  PlanLeg,
+  PlanValidationResult,
+  ResolverOrder,
+  ResolverPlan
+} from "./validate.js";
+
+export interface BuildOrderPlanOptions {
+  /** Defaults to `"fill"` (lock the destination leg). */
+  action?: PlanAction;
+  /** Inject the build time; defaults to wall clock. */
+  now?: number;
+  /**
+   * Override the plan deadline. Defaults to the earlier of the two leg
+   * timelocks — the resolver must settle before either window closes.
+   */
+  expiresAt?: number;
+}
+
+function copyLeg(leg: PlanLeg): PlanLeg {
+  return { ...leg };
+}
+
+/**
+ * Build an order-drift plan for `order` from the resolver's local view.
+ *
+ * The returned plan is a snapshot: it never aliases the order's legs,
+ * so later mutation of the order object cannot silently change a plan
+ * that has already been validated. The plan is then checked with
+ * `validatePlan` / `validatePlanForSubmit`.
+ */
+export function buildOrderPlan(
+  order: ResolverOrder,
+  options: BuildOrderPlanOptions = {}
+): ResolverPlan {
+  const now = options.now ?? Math.floor(Date.now() / 1000);
+  const expiresAt =
+    options.expiresAt ?? Math.min(order.src.timelock, order.dst.timelock);
+  return {
+    publicId: order.publicId,
+    action: options.action ?? "fill",
+    hashlock: order.hashlock,
+    src: copyLeg(order.src),
+    dst: copyLeg(order.dst),
+    expiresAt,
+    builtAt: now
+  };
+}

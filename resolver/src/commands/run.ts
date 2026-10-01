@@ -2,7 +2,7 @@ import { loadConfig } from "../config.js";
 import { getLogger } from "../logger.js";
 import { EthereumListener } from "../listeners/ethereum.js";
 import { SorobanListener } from "../listeners/soroban.js";
-import { checkPreflight } from "./check.js";
+import { checkDeploymentAddresses, checkPreflight } from "./check.js";
 import { buildPlan } from "../planner/index.js";
 import { observedFromEthereumEvent } from "../planner/index.js";
 import { checkCoordinatorNetwork } from "../network-agreement.js";
@@ -16,6 +16,8 @@ export async function runCommand(opts: RunOptions = {}): Promise<void> {
   const cfg = loadConfig();
   const log = getLogger(cfg.logLevel);
   log.info({ network: cfg.network, dryRun }, "OverSync resolver starting");
+
+  await checkDeploymentAddresses(cfg);
 
   // Refuse to start when the configured coordinator targets a different
   // chain. Unreachable coordinators remain a warning so observation mode can

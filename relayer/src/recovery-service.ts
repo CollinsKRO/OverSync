@@ -1,551 +1,388 @@
 /**
- * @fileoverview Recovery Service for Ethereum-Stellar Bridge
- * @description Handles timelock monitoring, auto-refund, and emergency recovery
+ * @fileoverview Recovery Service — tracker-aware relay recovery.
+ *
+ * ## Why this exists
+ * The original recovery service kept its own in-memory Map of "recovery
+ * requests" that was completely separate from `RelaySubmissionTracker`.
+ * After a restart the tracker still had rows for submissions that were
+ * in-flight or had timed out, but the recovery service didn't know about
+ * them.  It would therefore create a brand-new submission for the same
+ * logical action, broadcasting a second claim or refund transaction.
+ *
+ * ## What changed
+ * Recovery is now a *reader* of the tracker, not a second submitter:
+ *
+ * 1. **Startup bootstrap** — `start()` loads every `in_flight` or
+ *    `failed` row from the tracker and polls each one via the RPC
+ *    before deciding whether new work is needed.
+ *
+ * 2. **Confirmed hash short-circuit** — if the RPC reports the
+ *    transaction as confirmed the record is patched to `succeeded`
+ *    (via a no-op re-submit that returns `already_handled`) and no
+ *    second broadcast is made.
+ *
+ * 3. **Expired hash replacement** — if the RPC reports the transaction
+ *    as expired/dropped *and* the record is not already succeeded or
+ *    in-flight, the record is forgotten so the next `submit()` call
+ *    gets a clean slate.  The replacement is performed exactly once
+ *    because `forget()` only removes the old key; the new submission
+ *    immediately re-registers under the same key.
+ *
+ * 4. **Network guard** — the tracker records the `chain` field of every
+ *    action.  Before starting, `RecoveryService` compares the chains
+ *    present in the tracker against the configured `expectedChains` set
+ *    and throws a `NetworkMismatchError` if any row belongs to an
+ *    unexpected chain.
+ *
+ * ## RPC abstraction
+ * All on-chain queries are performed through the `TxStatusProvider`
+ * interface so the real Ethereum/Stellar provider can be swapped for a
+ * stub in tests without touching process-level globals.
  */
 
-import { EventEmitter } from 'events';
-import { OrdersService } from './orders.js';
-import { ethereumListener } from './ethereum-listener.js';
-import FusionEventManager, { EventType } from './event-handlers.js';
-import { ActiveOrder } from './types.js';
-import { getCurrentTimestamp } from './utils.js';
+import {
+  RelaySubmissionTracker,
+  type RelayAction,
+  type SubmissionRecord,
+} from './relay-submission-tracker.js';
 
-// Recovery status types
-export enum RecoveryStatus {
-  Pending = 'pending',
-  InProgress = 'in_progress',
-  Completed = 'completed',
-  Failed = 'failed',
-  Cancelled = 'cancelled'
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/** What the RPC layer reports for a previously-broadcast transaction. */
+export type TxStatus =
+  | { kind: 'confirmed' }   // on-chain and finalised
+  | { kind: 'pending' }     // still in the mempool / not yet finalised
+  | { kind: 'expired' }     // dropped / nonce superseded / never landed
+  | { kind: 'unknown' };    // no information — treat conservatively
+
+/**
+ * Minimal RPC abstraction used by the recovery service.
+ * Swap in a stub for unit tests; no ethers/stellar-sdk imports required.
+ */
+export interface TxStatusProvider {
+  /**
+   * Return the current status of a previously-submitted transaction.
+   *
+   * @param txHash   The hash that was broadcast, stored in `record.result`.
+   * @param chain    The target chain, e.g. `'ethereum'` or `'stellar'`.
+   */
+  getTxStatus(txHash: string, chain: string): Promise<TxStatus>;
 }
 
-export enum RecoveryType {
-  TimeoutRefund = 'timeout_refund',
-  EmergencyRefund = 'emergency_refund',
-  PublicWithdrawal = 'public_withdrawal',
-  ForceRecovery = 'force_recovery'
+/** Thrown by `RecoveryService.start()` when the tracker holds rows for a
+ *  chain that is not in `expectedChains`. */
+export class NetworkMismatchError extends Error {
+  readonly unexpected: string[];
+  readonly expected: string[];
+  constructor(unexpected: string[], expected: string[]) {
+    super(
+      `Recovery refused: tracker contains rows for chains [${unexpected.join(', ')}] ` +
+        `which are not in the configured set [${expected.join(', ')}]`
+    );
+    this.name = 'NetworkMismatchError';
+    this.unexpected = unexpected;
+    this.expected = expected;
+  }
 }
 
-// Recovery request interface
-export interface RecoveryRequest {
-  id: string;
-  orderHash: string;
-  type: RecoveryType;
-  status: RecoveryStatus;
-  initiator: string;
-  reason: string;
-  createdAt: number;
-  updatedAt: number;
-  metadata: {
-    srcChainId?: number;
-    dstChainId?: number;
-    amount?: string;
-    token?: string;
-    timelock?: number;
-    expired?: boolean;
-    emergencyReason?: string;
-    test?: boolean;
-  };
+export interface RecoveryServiceConfig {
+  /**
+   * The chains this process is authorised to handle, e.g.
+   * `['ethereum', 'stellar']`.  Any tracker row for a different chain
+   * will cause `start()` to throw a `NetworkMismatchError`.
+   */
+  expectedChains: string[];
+
+  /**
+   * How often the polling loop runs (ms).  Defaults to 30 000.
+   * Set to 0 to disable the background loop (useful in tests that drive
+   * the service manually).
+   */
+  pollingIntervalMs?: number;
+
+  /**
+   * Optional logger.  Defaults to `console`.
+   */
+  logger?: Pick<Console, 'log' | 'warn' | 'error'>;
 }
 
-// Recovery statistics
-export interface RecoveryStats {
-  totalRecoveries: number;
-  successfulRecoveries: number;
-  failedRecoveries: number;
-  pendingRecoveries: number;
-  totalValueRecovered: string;
-  averageRecoveryTime: number;
-  lastRecoveryAt: number;
+/** Summary produced by `RecoveryService.recoverPendingRows()`. */
+export interface RecoveryReport {
+  /** Rows that were confirmed on-chain — no action taken. */
+  alreadyConfirmed: string[];
+  /** Rows that were replaced because their tx was expired/dropped. */
+  replaced: string[];
+  /** Rows that are still pending on-chain — nothing to do yet. */
+  stillPending: string[];
+  /** Rows where the status was unknown — left untouched. */
+  unknown: string[];
+  /** Any errors encountered per key. */
+  errors: Record<string, string>;
 }
 
-// Recovery configuration
-export interface RecoveryConfig {
-  monitoringInterval: number; // ms
-  autoRefundEnabled: boolean;
-  emergencyEnabled: boolean;
-  maxRetries: number;
-  retryDelay: number;
-  gracePeriod: number; // seconds after timelock
-}
+// ---------------------------------------------------------------------------
+// RecoveryService
+// ---------------------------------------------------------------------------
 
-export class RecoveryService extends EventEmitter {
-  private ordersService: OrdersService;
-  private eventManager: FusionEventManager;
-  private config: RecoveryConfig;
-  private recoveryRequests: Map<string, RecoveryRequest> = new Map();
-  private monitoringInterval: NodeJS.Timeout | null = null;
-  private stats: RecoveryStats;
+export class RecoveryService {
+  private readonly tracker: RelaySubmissionTracker;
+  private readonly provider: TxStatusProvider;
+  private readonly cfg: Required<Omit<RecoveryServiceConfig, 'logger'>> &
+    Pick<RecoveryServiceConfig, 'logger'>;
+
+  private pollingHandle: ReturnType<typeof setInterval> | null = null;
+  private started = false;
 
   constructor(
-    ordersService: OrdersService,
-    eventManager: FusionEventManager,
-    config: RecoveryConfig
+    tracker: RelaySubmissionTracker,
+    provider: TxStatusProvider,
+    config: RecoveryServiceConfig
   ) {
-    super();
-    this.ordersService = ordersService;
-    this.eventManager = eventManager;
-    this.config = config;
-    this.stats = {
-      totalRecoveries: 0,
-      successfulRecoveries: 0,
-      failedRecoveries: 0,
-      pendingRecoveries: 0,
-      totalValueRecovered: '0',
-      averageRecoveryTime: 0,
-      lastRecoveryAt: 0
+    this.tracker = tracker;
+    this.provider = provider;
+    this.cfg = {
+      expectedChains: config.expectedChains,
+      pollingIntervalMs: config.pollingIntervalMs ?? 30_000,
+      logger: config.logger,
     };
-
-    this.startMonitoring();
-    this.setupEventListeners();
   }
 
+  // -------------------------------------------------------------------------
+  // Public API
+  // -------------------------------------------------------------------------
+
   /**
-   * Start timelock monitoring
+   * Bootstrap the recovery service.
+   *
+   * 1. Validates that every pending tracker row belongs to an expected chain.
+   * 2. Polls pending rows and resolves their status via the RPC.
+   * 3. Starts the background polling loop (unless `pollingIntervalMs` is 0).
+   *
+   * Throws `NetworkMismatchError` if any row targets an unexpected chain.
+   * Safe to call multiple times — subsequent calls are no-ops.
    */
-  private startMonitoring(): void {
-    if (this.monitoringInterval) {
-      clearInterval(this.monitoringInterval);
+  async start(): Promise<void> {
+    if (this.started) return;
+    this.started = true;
+
+    this.log('recovery-service: starting bootstrap …');
+
+    // Step 1 — network guard
+    this.assertNetworkMatch();
+
+    // Step 2 — poll all pending rows before accepting new work
+    await this.recoverPendingRows();
+
+    // Step 3 — start background loop
+    if (this.cfg.pollingIntervalMs > 0) {
+      this.pollingHandle = setInterval(() => {
+        void this.recoverPendingRows().catch((err) =>
+          this.cfg.logger?.error?.('recovery-service: background poll error', err)
+        );
+      }, this.cfg.pollingIntervalMs);
     }
 
-    this.monitoringInterval = setInterval(() => {
-      this.monitorTimelocksAndRecover();
-    }, this.config.monitoringInterval);
-
-    console.log('✅ Recovery Service: Timelock monitoring started');
+    this.log('recovery-service: bootstrap complete');
   }
 
   /**
-   * Setup event listeners
+   * Stop the background polling loop.
    */
-  private setupEventListeners(): void {
-    // Listen to order events
-    this.eventManager.on('order_created', (data) => {
-      this.trackNewOrder(data.orderHash);
-    });
-
-    this.eventManager.on('order_cancelled', (data) => {
-      this.handleOrderCancellation(data.orderHash);
-    });
-
-    this.eventManager.on('order_filled', (data) => {
-      this.handleOrderCompletion(data.orderHash);
-    });
+  stop(): void {
+    if (this.pollingHandle !== null) {
+      clearInterval(this.pollingHandle);
+      this.pollingHandle = null;
+    }
+    this.started = false;
+    this.log('recovery-service: stopped');
   }
 
   /**
-   * Monitor timelocks and initiate recovery
+   * Examine every `in_flight` and `failed` tracker row and, for each one,
+   * query the RPC to decide what should happen next:
+   *
+   * - **confirmed** → patch the record to `succeeded` via a no-op
+   *   re-submit so the duplicate gate prevents any second broadcast.
+   * - **expired/dropped** → `forget()` the record so the caller can
+   *   re-submit under the same key without hitting the terminal-failure
+   *   guard.  The replacement happens exactly once.
+   * - **pending / unknown** → leave the record alone; the in-flight guard
+   *   in the tracker already prevents a second broadcast.
+   *
+   * Returns a structured report for observability/testing.
    */
-  private async monitorTimelocksAndRecover(): Promise<void> {
-    try {
-      const activeOrders = this.ordersService.getActiveOrders();
-      const currentTime = getCurrentTimestamp();
+  async recoverPendingRows(): Promise<RecoveryReport> {
+    const report: RecoveryReport = {
+      alreadyConfirmed: [],
+      replaced: [],
+      stillPending: [],
+      unknown: [],
+      errors: {},
+    };
 
-      for (const order of activeOrders.items) {
-        if (this.shouldInitiateRecovery(order, currentTime)) {
-          await this.initiateTimeoutRecovery(order);
+    const rows = this.tracker
+      .list()
+      .filter((r) => r.status === 'in_flight' || r.status === 'failed');
+
+    if (rows.length === 0) return report;
+
+    this.log(`recovery-service: polling ${rows.length} pending row(s) …`);
+
+    await Promise.all(
+      rows.map(async (record) => {
+        try {
+          await this.processRow(record, report);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          report.errors[record.key] = msg;
+          this.cfg.logger?.error?.(
+            `recovery-service: error processing row ${record.key}: ${msg}`
+          );
         }
-      }
-    } catch (error) {
-      console.error('❌ Recovery monitoring error:', error);
-    }
-  }
-
-  /**
-   * Check if recovery should be initiated
-   */
-  private shouldInitiateRecovery(order: ActiveOrder, currentTime: number): boolean {
-    // Check if timelock has expired
-    const timelock = order.deadline;
-    const gracePeriod = this.config.gracePeriod;
-    
-    return (
-      currentTime > timelock + gracePeriod &&
-      !this.isRecoveryInProgress(order.orderHash) &&
-      this.config.autoRefundEnabled
+      })
     );
+
+    this.log(
+      `recovery-service: poll complete — confirmed=${report.alreadyConfirmed.length} ` +
+        `replaced=${report.replaced.length} pending=${report.stillPending.length} ` +
+        `unknown=${report.unknown.length} errors=${Object.keys(report.errors).length}`
+    );
+
+    return report;
   }
 
+  // -------------------------------------------------------------------------
+  // Internal helpers
+  // -------------------------------------------------------------------------
+
   /**
-   * Initiate timeout recovery
+   * Guard: throw `NetworkMismatchError` if the tracker contains rows for
+   * chains that are not in `expectedChains`.
    */
-  private async initiateTimeoutRecovery(order: ActiveOrder): Promise<void> {
-    const recoveryId = `recovery_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    const recoveryRequest: RecoveryRequest = {
-      id: recoveryId,
-      orderHash: order.orderHash,
-      type: RecoveryType.TimeoutRefund,
-      status: RecoveryStatus.Pending,
-      initiator: 'system',
-      reason: 'Timelock expired',
-      createdAt: getCurrentTimestamp(),
-      updatedAt: getCurrentTimestamp(),
-      metadata: {
-        srcChainId: order.srcChainId,
-        dstChainId: order.dstChainId,
-        amount: order.order.makingAmount,
-        token: order.order.makerAsset,
-        timelock: order.deadline,
-        expired: true
+  private assertNetworkMatch(): void {
+    const expected = new Set(this.cfg.expectedChains);
+    const unexpected = new Set<string>();
+
+    for (const record of this.tracker.list()) {
+      const chain = record.action.chain;
+      if (!expected.has(chain)) {
+        unexpected.add(chain);
       }
-    };
-
-    this.recoveryRequests.set(recoveryId, recoveryRequest);
-    this.stats.pendingRecoveries++;
-
-    console.log(`🔄 Recovery initiated for order ${order.orderHash} (${recoveryId})`);
-    
-    // Emit recovery event
-    this.eventManager.emitEvent(EventType.Recovery, order.orderHash, {
-      recoveryId,
-      type: RecoveryType.TimeoutRefund,
-      status: RecoveryStatus.Pending,
-      orderHash: order.orderHash,
-      timestamp: getCurrentTimestamp()
-    });
-
-    // Execute recovery
-    await this.executeRecovery(recoveryId);
-  }
-
-  /**
-   * Execute recovery process
-   */
-  private async executeRecovery(recoveryId: string): Promise<void> {
-    const recovery = this.recoveryRequests.get(recoveryId);
-    if (!recovery) {
-      console.error(`❌ Recovery ${recoveryId} not found`);
-      return;
     }
 
-    recovery.status = RecoveryStatus.InProgress;
-    recovery.updatedAt = getCurrentTimestamp();
-
-    try {
-      const order = this.ordersService.getActiveOrders().items.find(
-        o => o.orderHash === recovery.orderHash
+    if (unexpected.size > 0) {
+      throw new NetworkMismatchError(
+        Array.from(unexpected).sort(),
+        Array.from(expected).sort()
       );
-
-      if (!order) {
-        throw new Error('Order not found');
-      }
-
-      // Execute recovery based on type
-      switch (recovery.type) {
-        case RecoveryType.TimeoutRefund:
-          await this.executeTimeoutRefund(recovery, order);
-          break;
-        case RecoveryType.EmergencyRefund:
-          await this.executeEmergencyRefund(recovery, order);
-          break;
-        case RecoveryType.PublicWithdrawal:
-          await this.executePublicWithdrawal(recovery, order);
-          break;
-        case RecoveryType.ForceRecovery:
-          await this.executeForceRecovery(recovery, order);
-          break;
-      }
-
-      // Mark as completed
-      recovery.status = RecoveryStatus.Completed;
-      recovery.updatedAt = getCurrentTimestamp();
-      
-      this.stats.successfulRecoveries++;
-      this.stats.pendingRecoveries--;
-      this.stats.totalValueRecovered = (
-        BigInt(this.stats.totalValueRecovered) + BigInt(order.order.makingAmount)
-      ).toString();
-      this.stats.lastRecoveryAt = getCurrentTimestamp();
-
-      console.log(`✅ Recovery completed: ${recoveryId}`);
-      
-      // Emit success event
-      this.eventManager.emitEvent(EventType.Recovery, recovery.orderHash, {
-        recoveryId,
-        type: recovery.type,
-        status: RecoveryStatus.Completed,
-        orderHash: recovery.orderHash,
-        timestamp: getCurrentTimestamp()
-      });
-
-    } catch (error) {
-      console.error(`❌ Recovery failed: ${recoveryId}`, error);
-      
-      recovery.status = RecoveryStatus.Failed;
-      recovery.updatedAt = getCurrentTimestamp();
-      
-      this.stats.failedRecoveries++;
-      this.stats.pendingRecoveries--;
-
-      // Emit failure event
-      this.eventManager.emitEvent(EventType.Recovery, recovery.orderHash, {
-        recoveryId,
-        type: recovery.type,
-        status: RecoveryStatus.Failed,
-        orderHash: recovery.orderHash,
-        error: error instanceof Error ? error.message : 'Unknown error',
-        timestamp: getCurrentTimestamp()
-      });
-
-      // Retry if configured
-      if (this.config.maxRetries > 0) {
-        setTimeout(() => {
-          this.retryRecovery(recoveryId);
-        }, this.config.retryDelay);
-      }
     }
   }
 
   /**
-   * Execute timeout refund
+   * Process a single tracker row:
+   *  - Extract the tx hash from `record.result` (stored as `{ hash: string }` or a bare string).
+   *  - Query the RPC.
+   *  - Act on the result.
    */
-  private async executeTimeoutRefund(recovery: RecoveryRequest, order: ActiveOrder): Promise<void> {
-    console.log(`🔄 Executing timeout refund for order ${order.orderHash}`);
-    
-    // 1. Ethereum refund
-    if (order.srcChainId === 1) { // Ethereum
-      await this.executeEthereumRefund(order);
-    }
+  private async processRow(
+    record: SubmissionRecord,
+    report: RecoveryReport
+  ): Promise<void> {
+    const txHash = extractTxHash(record.result);
 
-    // 2. Stellar refund
-    if (order.dstChainId === 999) { // Stellar
-      await this.executeStellarRefund(order);
-    }
-
-    // 3. Update order status
-    // This would normally update the order in the database
-    console.log(`✅ Timeout refund completed for order ${order.orderHash}`);
-  }
-
-  /**
-   * Execute emergency refund
-   */
-  private async executeEmergencyRefund(recovery: RecoveryRequest, order: ActiveOrder): Promise<void> {
-    console.log(`🚨 Executing emergency refund for order ${order.orderHash}`);
-    console.log(`Emergency reason: ${recovery.metadata.emergencyReason}`);
-    
-    // Emergency refund logic - more aggressive, bypasses normal checks
-    await this.executeEthereumEmergencyRefund(order);
-    await this.executeStellarEmergencyRefund(order);
-    
-    console.log(`✅ Emergency refund completed for order ${order.orderHash}`);
-  }
-
-  /**
-   * Execute public withdrawal
-   */
-  private async executePublicWithdrawal(recovery: RecoveryRequest, order: ActiveOrder): Promise<void> {
-    console.log(`🔓 Executing public withdrawal for order ${order.orderHash}`);
-    
-    // Public withdrawal - anyone can trigger after timelock + grace period
-    await this.executePublicEthereumWithdrawal(order);
-    await this.executePublicStellarWithdrawal(order);
-    
-    console.log(`✅ Public withdrawal completed for order ${order.orderHash}`);
-  }
-
-  /**
-   * Execute force recovery (admin only)
-   */
-  private async executeForceRecovery(recovery: RecoveryRequest, order: ActiveOrder): Promise<void> {
-    console.log(`⚡ Executing force recovery for order ${order.orderHash}`);
-    
-    // Force recovery - admin override
-    await this.executeForceEthereumRecovery(order);
-    await this.executeForceeStellarRecovery(order);
-    
-    console.log(`✅ Force recovery completed for order ${order.orderHash}`);
-  }
-
-  /**
-   * Ethereum refund operations
-   */
-  private async executeEthereumRefund(order: ActiveOrder): Promise<void> {
-    // Mock implementation - would call actual Ethereum contract
-    console.log(`🔄 Ethereum refund: ${order.order.makingAmount} ${order.order.makerAsset}`);
-    
-    // Simulate contract call
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    console.log(`✅ Ethereum refund successful`);
-  }
-
-  private async executeEthereumEmergencyRefund(order: ActiveOrder): Promise<void> {
-    console.log(`🚨 Ethereum emergency refund: ${order.order.makingAmount} ${order.order.makerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 500));
-    console.log(`✅ Ethereum emergency refund successful`);
-  }
-
-  private async executePublicEthereumWithdrawal(order: ActiveOrder): Promise<void> {
-    console.log(`🔓 Ethereum public withdrawal: ${order.order.makingAmount} ${order.order.makerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    console.log(`✅ Ethereum public withdrawal successful`);
-  }
-
-  private async executeForceEthereumRecovery(order: ActiveOrder): Promise<void> {
-    console.log(`⚡ Ethereum force recovery: ${order.order.makingAmount} ${order.order.makerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 800));
-    console.log(`✅ Ethereum force recovery successful`);
-  }
-
-  /**
-   * Stellar refund operations
-   */
-  private async executeStellarRefund(order: ActiveOrder): Promise<void> {
-    console.log(`🔄 Stellar refund: ${order.order.takingAmount} ${order.order.takerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 1200));
-    console.log(`✅ Stellar refund successful`);
-  }
-
-  private async executeStellarEmergencyRefund(order: ActiveOrder): Promise<void> {
-    console.log(`🚨 Stellar emergency refund: ${order.order.takingAmount} ${order.order.takerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 600));
-    console.log(`✅ Stellar emergency refund successful`);
-  }
-
-  private async executePublicStellarWithdrawal(order: ActiveOrder): Promise<void> {
-    console.log(`🔓 Stellar public withdrawal: ${order.order.takingAmount} ${order.order.takerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 1100));
-    console.log(`✅ Stellar public withdrawal successful`);
-  }
-
-  private async executeForceeStellarRecovery(order: ActiveOrder): Promise<void> {
-    console.log(`⚡ Stellar force recovery: ${order.order.takingAmount} ${order.order.takerAsset}`);
-    await new Promise(resolve => setTimeout(resolve, 900));
-    console.log(`✅ Stellar force recovery successful`);
-  }
-
-  /**
-   * Retry recovery
-   */
-  private async retryRecovery(recoveryId: string): Promise<void> {
-    const recovery = this.recoveryRequests.get(recoveryId);
-    if (!recovery || recovery.status === RecoveryStatus.Completed) {
+    // If there is no tx hash yet (e.g. the record was created but the
+    // executor never ran a single attempt), treat as unknown.
+    if (!txHash) {
+      report.unknown.push(record.key);
+      this.log(
+        `recovery-service: row ${record.key} has no tx hash — leaving untouched`
+      );
       return;
     }
 
-    console.log(`🔄 Retrying recovery: ${recoveryId}`);
-    recovery.status = RecoveryStatus.Pending;
-    recovery.updatedAt = getCurrentTimestamp();
+    const status = await this.provider.getTxStatus(txHash, record.action.chain);
 
-    await this.executeRecovery(recoveryId);
-  }
+    switch (status.kind) {
+      case 'confirmed': {
+        // The tx landed on-chain.  We patch the record to succeeded by
+        // calling submit() with a no-op executor that immediately resolves
+        // with the existing result.  Because the record is `in_flight` or
+        // `failed`, we first forget it so the tracker accepts the new call.
+        //
+        // Special case: if it is already `succeeded` somehow, do nothing.
+        if (record.status === 'succeeded') {
+          report.alreadyConfirmed.push(record.key);
+          return;
+        }
+        this.log(
+          `recovery-service: row ${record.key} confirmed on-chain — patching to succeeded`
+        );
+        // Forget the old record so submit() can create a fresh one.
+        this.tracker.forget(record.key);
+        // Re-submit with an executor that immediately resolves with the
+        // original result so the duplicate gate is armed.
+        await this.tracker.submit(record.action, () =>
+          Promise.resolve(record.result)
+        );
+        report.alreadyConfirmed.push(record.key);
+        break;
+      }
 
-  /**
-   * Manual recovery initiation
-   */
-  public async initiateManualRecovery(
-    orderHash: string,
-    type: RecoveryType,
-    initiator: string,
-    reason: string,
-    metadata: Partial<RecoveryRequest['metadata']> = {}
-  ): Promise<string> {
-    const recoveryId = `manual_recovery_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    const recoveryRequest: RecoveryRequest = {
-      id: recoveryId,
-      orderHash,
-      type,
-      status: RecoveryStatus.Pending,
-      initiator,
-      reason,
-      createdAt: getCurrentTimestamp(),
-      updatedAt: getCurrentTimestamp(),
-      metadata
-    };
+      case 'expired': {
+        // The tx was dropped.  Forget the record so a fresh submission can
+        // be made.  We do NOT re-submit here — we only clear the gate.
+        // The caller (the relay handler or a scheduled job) is responsible
+        // for broadcasting the replacement transaction exactly once.
+        this.log(
+          `recovery-service: row ${record.key} expired — forgetting for replacement`
+        );
+        this.tracker.forget(record.key);
+        report.replaced.push(record.key);
+        break;
+      }
 
-    this.recoveryRequests.set(recoveryId, recoveryRequest);
-    this.stats.pendingRecoveries++;
+      case 'pending': {
+        // Still in the mempool.  The in-flight / terminal-failure guard in
+        // the tracker already prevents a second broadcast.
+        report.stillPending.push(record.key);
+        break;
+      }
 
-    console.log(`🔄 Manual recovery initiated: ${recoveryId} by ${initiator}`);
-    
-    // Execute recovery
-    await this.executeRecovery(recoveryId);
-    
-    return recoveryId;
-  }
-
-  /**
-   * Emergency recovery
-   */
-  public async emergencyRecovery(
-    orderHash: string,
-    reason: string,
-    initiator: string
-  ): Promise<string> {
-    return this.initiateManualRecovery(
-      orderHash,
-      RecoveryType.EmergencyRefund,
-      initiator,
-      reason,
-      { emergencyReason: reason }
-    );
-  }
-
-  /**
-   * Utility methods
-   */
-  private isRecoveryInProgress(orderHash: string): boolean {
-    return Array.from(this.recoveryRequests.values()).some(
-      recovery => recovery.orderHash === orderHash && 
-      recovery.status === RecoveryStatus.InProgress
-    );
-  }
-
-  private trackNewOrder(orderHash: string): void {
-    console.log(`📊 Recovery tracking: New order ${orderHash}`);
-  }
-
-  private handleOrderCancellation(orderHash: string): void {
-    console.log(`📊 Recovery tracking: Order cancelled ${orderHash}`);
-  }
-
-  private handleOrderCompletion(orderHash: string): void {
-    console.log(`📊 Recovery tracking: Order completed ${orderHash}`);
-  }
-
-  /**
-   * Get recovery statistics
-   */
-  public getRecoveryStats(): RecoveryStats {
-    return { ...this.stats };
-  }
-
-  /**
-   * Get recovery requests
-   */
-  public getRecoveryRequests(): RecoveryRequest[] {
-    return Array.from(this.recoveryRequests.values());
-  }
-
-  /**
-   * Get specific recovery request
-   */
-  public getRecoveryRequest(recoveryId: string): RecoveryRequest | undefined {
-    return this.recoveryRequests.get(recoveryId);
-  }
-
-  /**
-   * Stop monitoring
-   */
-  public stopMonitoring(): void {
-    if (this.monitoringInterval) {
-      clearInterval(this.monitoringInterval);
-      this.monitoringInterval = null;
+      case 'unknown':
+      default: {
+        // No information — leave the record as-is to avoid accidental
+        // double-sends.
+        report.unknown.push(record.key);
+        break;
+      }
     }
-    console.log('🛑 Recovery Service: Monitoring stopped');
   }
 
-  /**
-   * Cleanup
-   */
-  public cleanup(): void {
-    this.stopMonitoring();
-    this.removeAllListeners();
-    console.log('🧹 Recovery Service: Cleanup completed');
+  private log(msg: string): void {
+    (this.cfg.logger ?? console).log?.(msg);
   }
 }
 
-export default RecoveryService; 
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract a transaction hash from whatever shape `record.result` might be.
+ * The tracker stores the executor's return value verbatim; relay executors
+ * typically return `{ hash: '0x…' }` or a plain string.
+ */
+function extractTxHash(result: unknown): string | null {
+  if (typeof result === 'string' && result.length > 0) return result;
+  if (result !== null && typeof result === 'object') {
+    const obj = result as Record<string, unknown>;
+    if (typeof obj['hash'] === 'string' && obj['hash'].length > 0) return obj['hash'];
+    if (typeof obj['txHash'] === 'string' && obj['txHash'].length > 0) return obj['txHash'];
+    if (typeof obj['id'] === 'string' && obj['id'].length > 0) return obj['id'];
+  }
+  return null;
+}
+
+export default RecoveryService;

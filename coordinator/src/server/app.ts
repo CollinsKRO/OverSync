@@ -7,7 +7,8 @@ import { httpRequestDuration } from "../metrics.js";
 import { ordersRoutes } from "./routes/orders.js";
 import { secretsRoutes } from "./routes/secrets.js";
 import { quotesRoutes } from "./routes/quotes.js";
-import { createCorsMiddleware } from "./cors.js";
+import { createCorsMiddleware, createStrictCorsMiddleware } from "./cors.js";
+import { createReadinessRateLimiter } from "./readiness-rate-limit.js";
 import type { OrderService } from "../services/order-service.js";
 import type { SecretService } from "../services/secret-service.js";
 import type { QuoteService } from "../services/quote-service.js";
@@ -30,6 +31,7 @@ export function createApp(deps: AppDeps): Express {
   app.use(pinoHttp({ logger: deps.log }));
   app.use(express.json({ limit: maxRequestBodyBytes }));
   app.use(createCorsMiddleware(deps.corsOrigins));
+  app.use(publicResponseRedaction);
 
   // Prometheus HTTP duration instrumentation
   app.use((req, res, next) => {

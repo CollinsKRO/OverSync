@@ -1,8 +1,33 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { vi } from 'vitest';
+import { vi, beforeEach } from 'vitest';
 import LaunchReadinessSurface from './LaunchReadinessSurface';
+
+// ---------------------------------------------------------------------------
+// vi.hoisted ensures the mock variable is available at the time vi.mock runs
+// (vi.mock calls are hoisted to the top of the module by Vitest's transformer).
+// ---------------------------------------------------------------------------
+const { mockIsTestnet } = vi.hoisted(() => ({
+  mockIsTestnet: vi.fn<[], boolean>(() => true),
+}));
+
+// ---------------------------------------------------------------------------
+// Mock the network helpers so TestnetTractionCard's isTestnet() guard can be
+// controlled per-test.  The default is testnet (the common CI environment).
+// ---------------------------------------------------------------------------
+vi.mock('../config/networks', () => ({
+  isTestnet: mockIsTestnet,
+  isMainnetEnabled: vi.fn(() => false),
+  resolveNetworkMode: vi.fn((m: string) => m),
+  getCurrentNetwork: vi.fn(),
+  getContractAddresses: vi.fn(),
+}));
+
+beforeEach(() => {
+  // Reset to testnet before each test so tests are isolated.
+  mockIsTestnet.mockReturnValue(true);
+});
 
 function renderAt(path: string) {
   return render(
@@ -25,7 +50,8 @@ describe('LaunchReadinessSurface', () => {
     expect(screen.getByTestId('audit-gate-timeline')).toBeInTheDocument();
   });
 
-  test('renders the testnet traction card with measured metrics', () => {
+  test('renders the testnet traction card with measured metrics when in testnet mode', () => {
+    // isTestnet() returns true (set in beforeEach above).
     renderAt('/launch-readiness');
 
     expect(screen.getByText('Testnet traction')).toBeInTheDocument();
@@ -33,6 +59,20 @@ describe('LaunchReadinessSurface', () => {
     expect(screen.getByText('Deployed contracts')).toBeInTheDocument();
     expect(screen.getByText('Supported testnet routes')).toBeInTheDocument();
     expect(screen.getByText('ETH / XLM')).toBeInTheDocument();
+  });
+
+  test('hides the testnet traction card when in mainnet mode', () => {
+    mockIsTestnet.mockReturnValue(false);
+    renderAt('/launch-readiness');
+
+    // The card should be entirely absent — no heading, no metrics.
+    expect(screen.queryByText('Testnet traction')).not.toBeInTheDocument();
+    expect(screen.queryByText('Deployed contracts')).not.toBeInTheDocument();
+    // The rest of the page (heading, timeline) must still render.
+    expect(
+      screen.getByRole('heading', { level: 1, name: /Launch readiness/i })
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('audit-gate-timeline')).toBeInTheDocument();
   });
 
   test('locks the audit-first disclaimer copy so the suppression contract cannot regress', () => {

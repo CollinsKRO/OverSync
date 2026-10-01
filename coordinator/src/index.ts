@@ -9,6 +9,7 @@ import { QuoteService } from "./services/quote-service.js";
 import { SecretService } from "./services/secret-service.js";
 import { createApp } from "./server/app.js";
 import { EthereumListener } from "./listeners/ethereum-listener.js";
+import { ChainEventProcessor } from "./services/chain-events.js";
 import { SorobanListener } from "./listeners/soroban-listener.js";
 
 async function main(): Promise<void> {
@@ -20,7 +21,9 @@ async function main(): Promise<void> {
   const repo = new OrdersRepository(db);
 
   if (cfg.demoFixtures) {
-    await seedDemoFixtures(repo, log);
+    // Pass the network passphrase so the loader can refuse mainnet itself
+    // before touching the database (#279).
+    await seedDemoFixtures(repo, log, cfg.soroban.networkPassphrase);
   }
 
   const quotes = new QuoteService(log);
@@ -40,10 +43,12 @@ async function main(): Promise<void> {
     log.info({ port: cfg.port }, "HTTP server listening");
   });
 
-  const ethListener = new EthereumListener(cfg, orders, log);
-  const sorobanListener = new SorobanListener(cfg, orders, log);
-  ethListener.start();
-  sorobanListener.start();
+  const chainEvents = new ChainEventProcessor(repo, orders, secrets, log);
+  const ethListener = new EthereumListener(cfg, orders, log, chainEvents);
+  const sorobanListener = new SorobanListener(cfg, orders, log, chainEvents);
+  // A cursor saved for another network aborts startup (see main().catch).
+  await ethListener.start();
+  await sorobanListener.start();
 
   const shutdown = async (signal: string) => {
     log.info({ signal }, "shutting down");

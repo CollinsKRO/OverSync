@@ -1,4 +1,4 @@
-# OverSync v2 — Roadmap
+#OverSync v2 — Roadmap
 
 The bridging landscape is moving fast: Circle's CCTP v2 entered Stellar
 testnet in April 2026, Axelar's Interchain Token Service shipped on

@@ -113,7 +113,7 @@ The audit should verify the following invariants. Each is documented in source c
 ### 4.1 Escrow correctness
 
 1. Locked funds can only move under exactly two conditions: (a) correct preimage revealed before `timelock`, or (b) any caller after `timelock` invoking refund.
-2. `claimOrder` / `claim_order` requires `sha256(preimage) == hashlock` (both chains) OR `keccak256(preimage) == hashlock` (EVM only) AND `block.timestamp <= timelock`.
+2. `claimOrder` / `claim_order` rejects empty preimages and requires `sha256(uint256(orderId, 32-byte big-endian) || preimage) == hashlock` on both chains AND `block.timestamp <= timelock`.
 3. `refundOrder` / `refund_order` requires `block.timestamp > timelock` AND order status is exactly `Funded`.
 4. An order that has been claimed or refunded cannot transition again (idempotent terminal states).
 

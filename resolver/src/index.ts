@@ -23,8 +23,9 @@ program
   .command("register")
   .description("Stake into the ResolverRegistry so this resolver is eligible to fill orders.")
   .argument("[amount]", "Stake amount in the registry's stake asset (default: minStake)")
-  .action(async (amount?: string) => {
-    await registerCommand(amount);
+  .option("--dry-run", "Validate on-chain state and print the registration plan without submitting transactions", false)
+  .action(async (amount: string | undefined, opts: { dryRun: boolean }) => {
+    await registerCommand(amount, { dryRun: opts.dryRun || process.env.RESOLVER_DRY_RUN === "true" });
   });
 
 program

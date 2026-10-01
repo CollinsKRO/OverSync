@@ -92,6 +92,15 @@ e2e/load-test/reports/*.json
 e2e/load-test/reports/*.md
 # Fallback if LOAD_TEST_OUTPUT_DIR is set to an absolute path outside the tree
 
+# Relayer relay-submission store (transaction hashes the relayer has already
+# broadcast). Runtime state only — never commit it, and never delete it while
+# the relayer is running: it is what stops a restart from resubmitting a
+# settled payment. See relayer/src/relay-submission-store.ts.
+relay-submissions.json
+relay-submissions.json.*.tmp
+relayer/relay-submissions.json
+relayer/relay-submissions.json.*.tmp
+
 # Miscellaneous
 .cache/
 .parcel-cache/

@@ -7,6 +7,10 @@ export interface ReadinessRateLimitOptions {
   windowMs?: number;
   /** Injectable clock for deterministic tests. */
   now?: () => number;
+  /** Optional custom error message for rejections. */
+  message?: string;
+  /** Optional custom error code for rejections. */
+  errorCode?: string;
 }
 
 /**
@@ -20,6 +24,8 @@ export function createReadinessRateLimiter(options: ReadinessRateLimitOptions = 
   const limit = Math.max(1, Math.floor(options.limit ?? 30));
   const windowMs = Math.max(1_000, Math.floor(options.windowMs ?? 60_000));
   const now = options.now ?? (() => Date.now());
+  const message = options.message ?? "Too many health or readiness requests";
+  const errorCode = options.errorCode ?? "rate_limited";
   const buckets = new Map<string, { startedAt: number; count: number }>();
 
   return (req: Request, res: Response, next: NextFunction) => {
@@ -41,8 +47,8 @@ export function createReadinessRateLimiter(options: ReadinessRateLimitOptions = 
       const retryAfter = Math.max(1, Math.ceil((bucket.startedAt + windowMs - timestamp) / 1000));
       res.setHeader("Retry-After", String(retryAfter));
       res.status(429).json({
-        error: "rate_limited",
-        message: "Too many health or readiness requests",
+        error: errorCode,
+        message,
         retryAfterSeconds: retryAfter
       });
       return;

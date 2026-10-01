@@ -139,7 +139,9 @@ export function RefundTimelineSimulator() {
 
   return (
     <div className="rounded-xl border border-white/10 bg-black/20 p-4 font-sans text-sm glass-effect">
+
       {/* Header */}
+
       <div className="mb-4 flex items-center gap-2 border-b border-white/5 pb-2">
         <Shield className="h-4 w-4 text-cyan-400" />
         <h4 className="font-semibold text-white">Refund Timeline Simulator</h4>
@@ -148,6 +150,7 @@ export function RefundTimelineSimulator() {
         </span>
       </div>
       {/* Read-only disclaimer */}
+
       <div className="mb-4 flex items-start gap-2 rounded-lg bg-amber-500/5 border border-amber-500/20 px-3 py-2">
         <Info className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
         <p className="text-xs text-amber-300/80">
@@ -155,7 +158,6 @@ export function RefundTimelineSimulator() {
           and does not interact with any blockchain.
         </p>
       </div>
-
       {/* Example selector */}
 
       <div className="mb-4">
@@ -203,7 +205,6 @@ export function RefundTimelineSimulator() {
           <p className="text-xs text-slate-400 mt-0.5">{result.stateDescription}</p>
         </div>
       </div>
-
       {/* Claim and refund info */}
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">

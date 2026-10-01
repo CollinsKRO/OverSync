@@ -31,6 +31,8 @@ const MAINNET_HTLC_ABI = [
 ] as const;
 
 export interface RefundDialogProps {
+  /** Public order id used by the coordinator's authoritative eligibility check. */
+  coordinatorOrderId: string;
   /** Ethereum address of the user (used as wallet signer). */
   userAddress: Address;
   /**
@@ -58,6 +60,27 @@ export interface RefundDialogProps {
 
 type Phase = "checking" | "waiting" | "ready" | "submitting" | "done" | "error";
 
+interface RefundEligibility {
+  eligible: boolean;
+  lockedSides: Array<{
+    chain: "ethereum" | "stellar";
+    earliestRefundAt: number | null;
+  }>;
+}
+
+const PRODUCTION_API_BASE_URL = "https://oversync-k36vx.ondigitalocean.app";
+const API_BASE_URL = import.meta.env.PROD
+  ? ""
+  : (import.meta as any).env?.VITE_API_BASE_URL || PRODUCTION_API_BASE_URL;
+
+async function fetchRefundEligibility(coordinatorOrderId: string): Promise<RefundEligibility> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/orders/${encodeURIComponent(coordinatorOrderId)}/refund-eligibility`
+  );
+  if (!response.ok) throw new Error(`Coordinator returned ${response.status} while checking refund eligibility.`);
+  return response.json();
+}
+
 function formatRemaining(seconds: number): string {
   if (seconds <= 0) return "expired";
   const h = Math.floor(seconds / 3600);
@@ -78,6 +101,7 @@ function formatRemaining(seconds: number): string {
 export function RefundDialog(props: RefundDialogProps) {
   const [phase, setPhase] = useState<Phase>("checking");
   const [error, setError] = useState<string | null>(null);
+  const [eligibility, setEligibility] = useState<RefundEligibility | null>(null);
   const [txHash, setTxHash] = useState<`0x${string}` | null>(null);
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
 
@@ -89,8 +113,29 @@ export function RefundDialog(props: RefundDialogProps) {
   }, []);
 
   useEffect(() => {
-    setPhase(props.timelockUnixSeconds <= now ? "ready" : "waiting");
-  }, [props.timelockUnixSeconds, now]);
+    let active = true;
+    const refreshEligibility = async () => {
+      try {
+        const decision = await fetchRefundEligibility(props.coordinatorOrderId);
+        if (!active) return;
+        setEligibility(decision);
+        setError(null);
+        setPhase(decision.eligible ? "ready" : "waiting");
+      } catch (err) {
+        if (!active) return;
+        setEligibility(null);
+        setError(err instanceof Error ? err.message : "Unable to verify refund eligibility.");
+        setPhase("error");
+      }
+    };
+
+    void refreshEligibility();
+    const id = window.setInterval(() => void refreshEligibility(), 5_000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [props.coordinatorOrderId]);
 
   const remaining = useMemo(
     () => Math.max(props.timelockUnixSeconds - now, 0),
@@ -107,8 +152,16 @@ export function RefundDialog(props: RefundDialogProps) {
     }
 
     setError(null);
-    setPhase("submitting");
     try {
+      setPhase("checking");
+      const decision = await fetchRefundEligibility(props.coordinatorOrderId);
+      setEligibility(decision);
+      if (!decision.eligible) {
+        setPhase("waiting");
+        return;
+      }
+
+      setPhase("submitting");
       const mode: RefundContractMode = props.contractMode ?? "v2-escrow";
 
       let hash: `0x${string}`;
@@ -118,6 +171,12 @@ export function RefundDialog(props: RefundDialogProps) {
           throw new Error(
             "HTLCEscrow address is not configured for this network. v2 is testnet-only; switch to testnet to refund."
           );
+        }
+        const latestDecision = await fetchRefundEligibility(props.coordinatorOrderId);
+        setEligibility(latestDecision);
+        if (!latestDecision.eligible) {
+          setPhase("waiting");
+          return;
         }
         hash = await client.refundOrder(BigInt(props.orderId));
       } else {
@@ -153,6 +212,12 @@ export function RefundDialog(props: RefundDialogProps) {
           args: [orderIdBytes32],
           account: props.userAddress,
         });
+        const latestDecision = await fetchRefundEligibility(props.coordinatorOrderId);
+        setEligibility(latestDecision);
+        if (!latestDecision.eligible) {
+          setPhase("waiting");
+          return;
+        }
         hash = await walletClient.writeContract(request);
       }
 
@@ -214,8 +279,15 @@ export function RefundDialog(props: RefundDialogProps) {
         <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 flex items-center gap-2 mb-4">
           <Clock className="h-5 w-5 text-yellow-400" />
           <div className="text-sm">
-            <p className="text-yellow-300">Refund not yet available.</p>
-            <p className="text-gray-400">Time remaining: {formatRemaining(remaining)}</p>
+            <p className="text-yellow-300">Refund is not available on both chains.</p>
+            {eligibility?.lockedSides.map(({ chain, earliestRefundAt }) => (
+              <p key={chain} className="text-gray-400">
+                {chain === "ethereum" ? "Ethereum" : "Stellar"} {earliestRefundAt === null
+                  ? "timelock is not recorded by the coordinator."
+                  : `is still locked until ${new Date(earliestRefundAt * 1000).toISOString()}.`}
+              </p>
+            ))}
+            {remaining > 0 && <p className="text-gray-400">Ethereum time remaining: {formatRemaining(remaining)}</p>}
           </div>
         </div>
       )}
@@ -224,7 +296,7 @@ export function RefundDialog(props: RefundDialogProps) {
         <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3 flex items-center gap-2 mb-4">
           <ShieldCheck className="h-5 w-5 text-emerald-400" />
           <p className="text-sm text-emerald-300">
-            The timelock has expired. You can refund this order at any time.
+            The coordinator confirms both Ethereum and Stellar timelocks have expired.
           </p>
         </div>
       )}
@@ -262,7 +334,11 @@ export function RefundDialog(props: RefundDialogProps) {
 
       <button
         onClick={handleRefund}
-        disabled={(phase !== "ready" && phase !== "error") || networkState.hasAnyMismatch}
+        disabled={
+          (phase !== "ready" && !(phase === "error" && eligibility?.eligible)) ||
+          !eligibility?.eligible ||
+          networkState.hasAnyMismatch
+        }
         className="brand-cta flex w-full items-center justify-center gap-2 rounded-lg px-4 py-3 font-semibold transition disabled:cursor-not-allowed disabled:opacity-50"
       >
         {phase === "submitting" && <RefreshCw className="h-4 w-4 animate-spin" />}

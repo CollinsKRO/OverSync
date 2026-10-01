@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { generateSecret, hashSecret, verifyPreimage, assertValidSecretFormat, assertPreimageMatchesHashlock } from "../src/secrets/index.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { generateSecret, hashSecret, hashOrderPreimage, verifyPreimage, assertValidSecretFormat, assertPreimageMatchesHashlock } from "../src/secrets/index.js";
+
+const orderHashVector = readFileSync(
+  fileURLToPath(new URL("../../../e2e/fixtures/hashlock-v1.tsv", import.meta.url)),
+  "utf8"
+).split("\n").find((line) => line && !line.startsWith("#"))!.split("\t");
 
 describe("secrets", () => {
   it("generates a 32-byte secret with both digests", () => {
@@ -15,6 +22,15 @@ describe("secrets", () => {
     const s2 = hashSecret(s.preimage);
     expect(s2.sha256).toBe(s.sha256);
     expect(s2.keccak256).toBe(s.keccak256);
+  });
+
+  it("matches the shared order-bound hashlock vector", () => {
+    const [orderId, preimage, expected] = orderHashVector;
+    expect(hashOrderPreimage(BigInt(orderId), preimage as `0x${string}`)).toBe(expected);
+    expect(hashOrderPreimage(BigInt(orderId) + 1n, preimage as `0x${string}`)).not.toBe(expected);
+    expect(() => hashOrderPreimage(BigInt(orderId), "0x")).toThrow("preimage must not be empty");
+    expect(() => hashOrderPreimage(BigInt(orderId), "0x0g")).toThrow("even-length hex bytes");
+    expect(() => hashOrderPreimage(BigInt(orderId), "0x1")).toThrow("even-length hex bytes");
   });
 
   it("verifyPreimage detects both sha256 and keccak256 commitments", () => {

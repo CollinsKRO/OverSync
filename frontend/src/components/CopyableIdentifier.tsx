@@ -21,6 +21,28 @@ export interface CopyableIdentifierProps {
   mono?: boolean;
 }
 
+const TX_HASH = /^(0x[0-9a-fA-F]{64}|[0-9a-fA-F]{64})$/;
+const ORDER_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/;
+const STELLAR_SECRET = /^S[A-Z2-7]{55}$/;
+
+/** Order id or transaction hash only. URLs, preimages, and secrets are refused. */
+export function copyablePublicIdentifier(value: string): string | null {
+  if (!value || value.includes('://')) return null;
+  if (STELLAR_SECRET.test(value) || /preimage|secret/i.test(value)) return null;
+  if (TX_HASH.test(value) || ORDER_ID.test(value)) return value;
+  return null;
+}
+
+export async function copyPublicIdentifier(
+  value: string,
+  write: (text: string) => Promise<void>,
+): Promise<{ copied: boolean }> {
+  const allowed = copyablePublicIdentifier(value);
+  if (!allowed) return { copied: false };
+  await write(allowed);
+  return { copied: true };
+}
+
 function truncateMiddle(text: string, head: number, tail: number): string {
   if (text.length <= head + tail + 3) return text;
   return `${text.slice(0, head)}...${text.slice(-tail)}`;
@@ -53,8 +75,13 @@ export function CopyableIdentifier({
     (truncate ? truncateMiddle(value, truncateHead, truncateTail) : value);
 
   const handleCopy = useCallback(async () => {
+    const allowed = copyablePublicIdentifier(value);
+    if (!allowed) {
+      setState('error');
+      return;
+    }
     try {
-      await copyTextToClipboard(value);
+      await copyTextToClipboard(allowed);
       setState('copied');
       window.dispatchEvent(
         new CustomEvent('oversync-toast', {

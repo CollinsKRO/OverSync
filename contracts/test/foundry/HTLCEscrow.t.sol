@@ -40,8 +40,8 @@ contract HTLCEscrowFuzzTest is Test {
         return bound(sd, MIN_SD, 10 ether);
     }
 
-    function _hashlock(bytes memory preimage) internal pure returns (bytes32) {
-        return sha256(preimage);
+    function _hashlock(uint256 orderId, bytes memory preimage) internal pure returns (bytes32) {
+        return sha256(abi.encodePacked(orderId, preimage));
     }
 
     // ── fuzz: createOrder accepts any valid combination ───────────────────────
@@ -65,12 +65,13 @@ contract HTLCEscrowFuzzTest is Test {
         timelockSeconds = _boundTl(timelockSeconds);
 
         bytes memory preimage = abi.encodePacked(secret);
-        bytes32 hashlock = _hashlock(preimage);
+        uint256 orderId = htlc.nextOrderId();
+        bytes32 hashlock = _hashlock(orderId, preimage);
 
         uint256 total = amount + safetyDeposit;
         vm.deal(address(this), total);
 
-        uint256 orderId = htlc.createOrder{value: total}(
+        orderId = htlc.createOrder{value: total}(
             beneficiary, refundAddr, address(0),
             amount, safetyDeposit, hashlock, timelockSeconds
         );
@@ -87,7 +88,8 @@ contract HTLCEscrowFuzzTest is Test {
     function testFuzz_claimOrder_correctPreimage(bytes32 secret, uint64 timelockSeconds) public {
         timelockSeconds = _boundTl(timelockSeconds);
         bytes memory preimage = abi.encodePacked(secret);
-        bytes32 hashlock = _hashlock(preimage);
+        uint256 orderId = htlc.nextOrderId();
+        bytes32 hashlock = _hashlock(orderId, preimage);
 
         uint256 amount = 1 ether;
         uint256 sd     = MIN_SD;
@@ -95,10 +97,10 @@ contract HTLCEscrowFuzzTest is Test {
 
         address beneficiary = makeAddr("beneficiary");
         address refundAddr  = makeAddr("refund");
-        uint256 orderId = htlc.createOrder{value: amount + sd}(
+        assertEq(htlc.createOrder{value: amount + sd}(
             beneficiary, refundAddr, address(0),
             amount, sd, hashlock, timelockSeconds
-        );
+        ), orderId);
 
         // Claim from a separate EOA so the safety deposit transfer succeeds.
         address claimer = makeAddr("claimer");
@@ -114,16 +116,17 @@ contract HTLCEscrowFuzzTest is Test {
 
         bytes memory preimage      = abi.encodePacked(secret);
         bytes memory wrongPreimage = abi.encodePacked(wrongSecret);
-        bytes32 hashlock = _hashlock(preimage);
+        uint256 orderId = htlc.nextOrderId();
+        bytes32 hashlock = _hashlock(orderId, preimage);
 
         uint256 amount = 1 ether;
         uint256 sd     = MIN_SD;
         vm.deal(address(this), amount + sd);
 
-        uint256 orderId = htlc.createOrder{value: amount + sd}(
+        assertEq(htlc.createOrder{value: amount + sd}(
             makeAddr("b"), makeAddr("r"), address(0),
             amount, sd, hashlock, MIN_TL
-        );
+        ), orderId);
 
         vm.expectRevert(HTLCEscrow.InvalidPreimage.selector);
         htlc.claimOrder(orderId, wrongPreimage);
@@ -133,16 +136,17 @@ contract HTLCEscrowFuzzTest is Test {
 
     function testFuzz_refundOrder_afterExpiry(bytes32 secret, uint64 timelockSeconds) public {
         timelockSeconds = _boundTl(timelockSeconds);
-        bytes32 hashlock = _hashlock(abi.encodePacked(secret));
+        uint256 orderId = htlc.nextOrderId();
+        bytes32 hashlock = _hashlock(orderId, abi.encodePacked(secret));
 
         uint256 amount = 1 ether;
         uint256 sd     = MIN_SD;
         vm.deal(address(this), amount + sd);
 
-        uint256 orderId = htlc.createOrder{value: amount + sd}(
+        assertEq(htlc.createOrder{value: amount + sd}(
             makeAddr("b"), makeAddr("r"), address(0),
             amount, sd, hashlock, timelockSeconds
-        );
+        ), orderId);
 
         vm.warp(block.timestamp + timelockSeconds + 1);
         // Refund from a separate EOA so the safety deposit transfer succeeds.
@@ -156,16 +160,17 @@ contract HTLCEscrowFuzzTest is Test {
 
     function testFuzz_refundOrder_beforeExpiry_reverts(bytes32 secret, uint64 timelockSeconds) public {
         timelockSeconds = _boundTl(timelockSeconds);
-        bytes32 hashlock = _hashlock(abi.encodePacked(secret));
+        uint256 orderId = htlc.nextOrderId();
+        bytes32 hashlock = _hashlock(orderId, abi.encodePacked(secret));
 
         uint256 amount = 1 ether;
         uint256 sd     = MIN_SD;
         vm.deal(address(this), amount + sd);
 
-        uint256 orderId = htlc.createOrder{value: amount + sd}(
+        assertEq(htlc.createOrder{value: amount + sd}(
             makeAddr("b"), makeAddr("r"), address(0),
             amount, sd, hashlock, timelockSeconds
-        );
+        ), orderId);
 
         // still within timelock
         vm.warp(block.timestamp + timelockSeconds - 1);
@@ -202,7 +207,8 @@ contract HTLCHandler is Test {
         uint256 total  = amount + sd;
 
         bytes memory preimage = abi.encodePacked(secret);
-        bytes32 hashlock = sha256(preimage);
+        uint256 predictedOrderId = htlc.nextOrderId();
+        bytes32 hashlock = sha256(abi.encodePacked(predictedOrderId, preimage));
 
         vm.deal(address(this), total);
         uint256 orderId = htlc.createOrder{value: total}(

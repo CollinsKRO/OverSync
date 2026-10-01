@@ -1,6 +1,10 @@
 import { ethers } from "hardhat";
 
 async function main() {
+  const registryAddress = process.env.RESOLVER_REGISTRY_ADDRESS;
+  if (!registryAddress || !ethers.isAddress(registryAddress) || registryAddress === ethers.ZeroAddress) {
+    throw new Error("Set RESOLVER_REGISTRY_ADDRESS to the deployed resolver registry");
+  }
   console.log("🚀 Deploying MainnetHTLC Contract to Ethereum Mainnet...");
   console.log("========================================================");
 
@@ -43,7 +47,7 @@ async function main() {
     console.log("⛽ Current gas price:", ethers.formatUnits(feeData.gasPrice || 0n, "gwei"), "gwei");
     
     // Deploy with current network gas price but reduced gas limit
-    const mainnetHTLC = await MainnetHTLC.deploy({
+    const mainnetHTLC = await MainnetHTLC.deploy(registryAddress, {
       gasLimit: 2000000, // 2M gas limit (reduced for simplicity)
     });
     
@@ -98,7 +102,7 @@ async function main() {
     console.log(`   MAINNET_HTLC_ADDRESS=${contractAddress}`);
     console.log("");
     console.log("2. Verify contract on Etherscan:");
-    console.log(`   npx hardhat verify --network mainnet ${contractAddress}`);
+    console.log(`   npx hardhat verify --network mainnet ${contractAddress} ${registryAddress}`);
     console.log("");
     console.log("3. Update relayer configuration:");
     console.log(`   htlcBridge: '${contractAddress}' // Add to mainnet config`);

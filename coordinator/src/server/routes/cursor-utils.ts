@@ -128,3 +128,10 @@ export function validateHistoryCursor(raw: unknown, scope: CursorScope): CursorV
   }
   return { ok: true, cursor };
 }
+
+export function validateCursor(cursor: { offset: number; createdAt: number }): boolean {
+  if (typeof cursor.offset !== "number" || typeof cursor.createdAt !== "number") return false;
+  if (isNaN(cursor.offset) || isNaN(cursor.createdAt)) return false;
+  if (cursor.offset < 0) return false;
+  return true;
+}

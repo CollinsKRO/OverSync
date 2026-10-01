@@ -2,12 +2,19 @@
  * Permissionless XLM refund helper for failed XLM→ETH swaps.
  *
  * Lives outside index.ts so it can be reused by:
- *  - the inline `/api/orders/process` error handler (immediate refund),
+ *  - the `/api/orders/xlm-to-eth` error handler (immediate refund),
  *  - the `/api/orders/manual-refund` endpoint (user-initiated),
  *  - the background watchdog (rescues orders the user never retried).
  *
- * The function is intentionally side-effect-light: it only signs and
- * submits a Stellar payment. Order book bookkeeping is left to callers.
+ * The function is intentionally side-effect-light: it only builds, signs and
+ * (optionally) submits a Stellar payment. Order book bookkeeping is left to
+ * callers.
+ *
+ * `prepareXlmRefund` is the piece that makes hash-first submission possible:
+ * it stops *before* the network call and hands back the signed transaction,
+ * whose hash is computable locally. Callers pass that to
+ * `stageStellarTransaction()` so the relay submission tracker can persist the
+ * hash before the payment is ever submitted.
  */
 
 export type RefundNetworkMode = 'mainnet' | 'testnet';
@@ -39,40 +46,45 @@ export interface RefundXlmResult {
   ledger?: number;
 }
 
+/** A signed, but not yet submitted, refund payment. */
+export interface PreparedXlmRefund {
+  /**
+   * Signed Stellar transaction. `hash()` yields the local transaction hash,
+   * which is what makes hash-first submission possible. Typed loosely because
+   * the SDK is loaded dynamically and the concrete class is not needed here.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  transaction: any;
+  /** Amount the refund will pay, in XLM. */
+  amount: string;
+}
+
 /**
- * Submit a refund payment on Stellar. Throws on any error — callers
- * decide whether to surface, retry, or just log it.
+ * Build and sign the refund payment without submitting it.
+ *
+ * The amount is derived from the user's original payment (minus a dust margin
+ * for the refund's own fee) and falls back to the order amount, or to a
+ * conservative 0.1 XLM stub when neither is available.
  */
-export async function refundXlmToUser(args: RefundXlmArgs): Promise<RefundXlmResult> {
-  const {
-    Horizon,
-    Keypair,
-    Asset,
-    Operation,
-    TransactionBuilder,
-    Networks,
-    BASE_FEE,
-    Memo,
-  } = await import('@stellar/stellar-sdk');
+export async function prepareXlmRefund(args: RefundXlmArgs): Promise<PreparedXlmRefund> {
+  const { Horizon, Keypair, Asset, Operation, TransactionBuilder, Networks, BASE_FEE, Memo } =
+    await import('@stellar/stellar-sdk');
 
   const server = new Horizon.Server(args.horizonUrl);
   const keypair = Keypair.fromSecret(args.refundSecret);
   const account = await server.loadAccount(keypair.publicKey());
 
-  // Determine how much XLM to send back. We prefer the exact amount the
-  // user paid (lookup via tx hash) and fall back to the order amount or
-  // a conservative 0.1 XLM stub when neither is available.
-  let refundAmount = args.fallbackXlmAmount && Number(args.fallbackXlmAmount) > 0
-    ? args.fallbackXlmAmount
-    : '0.1';
+  let refundAmount =
+    args.fallbackXlmAmount && Number(args.fallbackXlmAmount) > 0
+      ? args.fallbackXlmAmount
+      : '0.1';
 
   if (args.stellarTxHash) {
     try {
       const ops = await server.operations().forTransaction(args.stellarTxHash).call();
-      const paymentOp: any = ops.records.find((op: any) =>
-        op.type === 'payment' &&
-        op.to === keypair.publicKey() &&
-        op.asset_type === 'native'
+      const paymentOp: any = ops.records.find(
+        (op: any) =>
+          op.type === 'payment' && op.to === keypair.publicKey() && op.asset_type === 'native'
       );
       if (paymentOp) {
         const original = parseFloat(paymentOp.amount);
@@ -102,10 +114,25 @@ export async function refundXlmToUser(args: RefundXlmArgs): Promise<RefundXlmRes
     .build();
 
   tx.sign(keypair);
-  const result: any = await server.submitTransaction(tx);
+  return { transaction: tx, amount: refundAmount };
+}
+
+/**
+ * Submit a refund payment on Stellar. Throws on any error — callers
+ * decide whether to surface, retry, or just log it.
+ *
+ * Prefer `prepareXlmRefund` + `stageStellarTransaction` + the relay submission
+ * tracker: that path records the transaction hash before the payment is
+ * broadcast, so an ambiguous submit can never become a second refund.
+ */
+export async function refundXlmToUser(args: RefundXlmArgs): Promise<RefundXlmResult> {
+  const prepared = await prepareXlmRefund(args);
+  const { Horizon } = await import('@stellar/stellar-sdk');
+  const server = new Horizon.Server(args.horizonUrl);
+  const result: any = await server.submitTransaction(prepared.transaction);
   return {
     hash: result.hash,
-    amount: refundAmount,
+    amount: prepared.amount,
     ledger: result.ledger,
   };
 }
