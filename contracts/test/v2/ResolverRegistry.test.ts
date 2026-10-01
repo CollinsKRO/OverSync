@@ -102,4 +102,64 @@ describe("ResolverRegistry v2", () => {
       registry.connect(resolver).slash(resolver.address, 1n)
     ).to.be.revertedWithCustomError(registry, "OwnableUnauthorizedAccount");
   });
+
+  // -----------------------------------------------------------------------
+  // Registry transition tests for issue #257
+  // -----------------------------------------------------------------------
+  describe("registry transitions affecting escrow claim eligibility", () => {
+    it("isActive returns false immediately after unregister", async () => {
+      const [, , , resolver] = await ethers.getSigners();
+      const { token, registry } = await deploy();
+      await token.transfer(resolver.address, MIN_STAKE);
+      await token.connect(resolver).approve(await registry.getAddress(), MIN_STAKE);
+      await registry.connect(resolver).register(MIN_STAKE);
+
+      expect(await registry.isActive(resolver.address)).to.be.true;
+
+      await registry.connect(resolver).unregister();
+
+      // Immediately after unregister isActive must be false —
+      // this is the state HTLCEscrow.claimOrder will see.
+      expect(await registry.isActive(resolver.address)).to.be.false;
+    });
+
+    it("isActive returns false after a full slash below minimum", async () => {
+      const [, , , resolver] = await ethers.getSigners();
+      const { token, registry } = await deploy();
+      await token.transfer(resolver.address, MIN_STAKE);
+      await token.connect(resolver).approve(await registry.getAddress(), MIN_STAKE);
+      await registry.connect(resolver).register(MIN_STAKE);
+
+      expect(await registry.isActive(resolver.address)).to.be.true;
+
+      // Slash all stake — brings remaining below minimum
+      await registry.slash(resolver.address, MIN_STAKE);
+
+      expect(await registry.isActive(resolver.address)).to.be.false;
+    });
+
+    it("isActive is restored after increaseStake brings stake back to minimum", async () => {
+      const [, , , resolver] = await ethers.getSigners();
+      const { token, registry } = await deploy();
+      // Provide extra stake so resolver can increase after slash
+      await token.transfer(resolver.address, MIN_STAKE * 3n);
+      await token.connect(resolver).approve(await registry.getAddress(), MIN_STAKE * 3n);
+      await registry.connect(resolver).register(MIN_STAKE);
+
+      // Slash enough to deactivate
+      await registry.slash(resolver.address, MIN_STAKE);
+      expect(await registry.isActive(resolver.address)).to.be.false;
+
+      // Resolver tops up stake above minimum
+      await registry.connect(resolver).increaseStake(MIN_STAKE);
+      expect(await registry.isActive(resolver.address)).to.be.true;
+    });
+
+    it("an address that was never registered is never active", async () => {
+      const [, , , , stranger] = await ethers.getSigners();
+      const { registry } = await deploy();
+
+      expect(await registry.isActive(stranger.address)).to.be.false;
+    });
+  });
 });

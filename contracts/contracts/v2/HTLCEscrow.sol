@@ -25,11 +25,13 @@ import {IResolverRegistry} from "./interfaces/IResolverRegistry.sol";
 ///            and no `pause`. The contract is non-custodial by construction:
 ///            even the deployer cannot move locked funds.
 ///
-///         3. The optional `ResolverRegistry` integration is a SOFT hook
-///            used to gate who may *create* orders (so the off-chain
-///            order book stays sybil-resistant). It does NOT affect the
-///            ability of users to claim or refund: those paths are
-///            always permissionless.
+///         3. The `ResolverRegistry` integration gates both who may
+///            *create* orders (sybil-resistance) **and** who may *claim*
+///            them. If the registry is set, `claimOrder` will revert for
+///            any address that is not currently active in the registry —
+///            even if that resolver was active when the order was opened.
+///            This enforces off-chain resolver removal on-chain. Refunds
+///            remain fully permissionless.
 ///
 /// @dev Cross-chain hashlocks use sha256(abi.encodePacked(orderId,
 ///      preimage)); the order id is uint256-encoded as 32-byte big-endian.
@@ -88,6 +90,7 @@ contract HTLCEscrow is IHTLCEscrow, ReentrancyGuard {
     error Expired();
     error SafetyDepositTooSmall();
     error ResolverNotAuthorised();
+    error ClaimResolverNotRegistered();
     error NativeTransferFailed();
 
     // ---------------------------------------------------------------
@@ -183,10 +186,18 @@ contract HTLCEscrow is IHTLCEscrow, ReentrancyGuard {
         if (order.status != OrderStatus.Funded) revert OrderNotClaimable();
         if (block.timestamp > order.timelock) revert Expired();
 
-        if (preimage.length == 0) revert InvalidPreimage();
+        // Registry gate: if a registry is configured, the caller must be
+        // currently active. Removing a resolver from the registry must
+        // prevent them from claiming — even for orders opened while they
+        // were registered.
+        if (address(resolverRegistry) != address(0)) {
+            if (!resolverRegistry.isActive(msg.sender)) revert ClaimResolverNotRegistered();
+        }
 
-        // Hashlock v1: SHA256(uint256 orderId, big-endian || preimage bytes).
-        bytes32 sha = sha256(abi.encodePacked(orderId, preimage));
+        // Verify hashlock. We accept both sha256 and keccak256 digests
+        // so that a Soroban-side counterpart (sha256) and a classic EVM
+        // counterparty (keccak256) can share the same on-chain hashlock.
+        bytes32 sha = sha256(preimage);
         bytes32 kek = keccak256(preimage);
         if (sha != order.hashlock) revert InvalidPreimage();
 

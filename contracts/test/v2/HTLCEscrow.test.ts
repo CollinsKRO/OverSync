@@ -766,4 +766,112 @@ describe("HTLCEscrow v2", () => {
       ).to.be.reverted;
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Registry-gated claimOrder tests (issue #257)
+  // -----------------------------------------------------------------------
+  describe("registry-gated claimOrder", () => {
+    const MIN_STAKE = ethers.parseEther("100");
+
+    /** Deploy a fully wired registry + escrow pair. */
+    async function deployWithRegistry() {
+      const [owner, slashBeneficiary, resolver, nonResolver] = await ethers.getSigners();
+
+      // Stake token
+      const Token = await ethers.getContractFactory("TestERC20");
+      const stakeToken = (await Token.deploy(
+        "Stake",
+        "STK",
+        ethers.parseEther("1000000")
+      )) as unknown as TestERC20;
+
+      // Registry
+      const Registry = await ethers.getContractFactory("ResolverRegistry");
+      const registry = await Registry.deploy(
+        await stakeToken.getAddress(),
+        MIN_STAKE,
+        slashBeneficiary.address,
+        owner.address
+      );
+
+      // Escrow pointing at the registry — registry gates both create and claim
+      const HTLCEscrowFactory = await ethers.getContractFactory("HTLCEscrow");
+      const escrow = (await HTLCEscrowFactory.deploy(
+        await registry.getAddress(),
+        0 // no min safety deposit for simplicity
+      )) as unknown as HTLCEscrow;
+
+      // Fund resolver with stake and register
+      await stakeToken.transfer(resolver.address, MIN_STAKE * 2n);
+      await stakeToken.connect(resolver).approve(await registry.getAddress(), MIN_STAKE);
+      await registry.connect(resolver).register(MIN_STAKE);
+
+      return { owner, slashBeneficiary, resolver, nonResolver, stakeToken, registry, escrow };
+    }
+
+    /** Create a standard native-ETH order; resolver must be the sender (registry-gated). */
+    async function createOrder(escrow: HTLCEscrow, resolver: any, beneficiary: any) {
+      const preimage = randomBytes32();
+      const hashlock = ethers.sha256(preimage);
+      await escrow.connect(resolver).createOrder(
+        beneficiary.address,
+        resolver.address,
+        ZERO_ADDR,
+        AMOUNT,
+        0n, // no safety deposit
+        hashlock,
+        TIMELOCK,
+        { value: AMOUNT }
+      );
+      return { preimage, hashlock };
+    }
+
+    it("allows a registered resolver to claim a valid order", async () => {
+      const { resolver, nonResolver, escrow } = await deployWithRegistry();
+      const { preimage } = await createOrder(escrow, resolver, nonResolver);
+
+      await expect(
+        escrow.connect(resolver).claimOrder(1, preimage)
+      ).to.not.be.reverted;
+
+      const order = await escrow.getOrder(1);
+      expect(order.status).to.equal(1); // Claimed
+    });
+
+    it("rejects a claim from an address that was never registered", async () => {
+      const { resolver, nonResolver, escrow } = await deployWithRegistry();
+      const { preimage } = await createOrder(escrow, resolver, nonResolver);
+
+      // nonResolver has never been in the registry
+      await expect(
+        escrow.connect(nonResolver).claimOrder(1, preimage)
+      ).to.be.revertedWithCustomError(escrow, "ClaimResolverNotRegistered");
+    });
+
+    it("rejects a claim from a resolver removed after the order was opened", async () => {
+      const { resolver, nonResolver, escrow, registry } = await deployWithRegistry();
+      const { preimage } = await createOrder(escrow, resolver, nonResolver);
+
+      // Resolver unregisters — order was already created while they were active
+      await registry.connect(resolver).unregister();
+
+      // Former resolver cannot claim despite having created the order
+      await expect(
+        escrow.connect(resolver).claimOrder(1, preimage)
+      ).to.be.revertedWithCustomError(escrow, "ClaimResolverNotRegistered");
+    });
+
+    it("refundOrder remains permissionless even when registry is set", async () => {
+      const [, , , , randomCleaner] = await ethers.getSigners();
+      const { resolver, nonResolver, escrow } = await deployWithRegistry();
+      await createOrder(escrow, resolver, nonResolver);
+
+      await time.increase(TIMELOCK + 1);
+
+      // Anyone — even an unregistered address — can trigger a refund
+      await expect(
+        escrow.connect(randomCleaner).refundOrder(1)
+      ).to.not.be.reverted;
+    });
+  });
 });

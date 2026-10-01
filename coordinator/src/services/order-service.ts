@@ -29,6 +29,16 @@ import {
   type TimelockValidationError
 } from "../utils/timelock-validator.js";
 
+/**
+ * Minimal interface the coordinator uses to verify that an Ethereum
+ * address is currently registered in the on-chain ResolverRegistry.
+ * Kept as a port so the service layer stays free of ethers / viem.
+ */
+export interface ResolverRegistryPort {
+  /** Returns true if `address` is currently active in the registry. */
+  isActive(address: string): Promise<boolean>;
+}
+
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_HASHLOCK = "0x" + "0".repeat(64);
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -192,11 +202,16 @@ interface AdvanceRequest {
   apply: (order: OrderRow, to: OrderStatus) => Promise<void>;
 }
 
-export class OrderService {
-  private config: ConfigService;
-
-  constructor(config: ConfigService) {
-    this.config = config;
+  constructor(
+    private readonly repo: OrdersRepository,
+    private readonly log: Logger,
+    /** Optional — when supplied, quoteId in announce requests is validated. */
+    private readonly quoteService?: QuoteService,
+    config?: ReturnType<typeof loadConfig>,
+    /** Optional — when supplied, buildClaim validates resolver registration. */
+    private readonly resolverRegistry?: ResolverRegistryPort
+  ) {
+    this.minGapSeconds = config?.timelockSafetyGapSeconds ?? 600;
   }
 
   async buildLockOrder(request: LockRequest): Promise<any> {
@@ -407,121 +422,38 @@ export class OrderService {
   }
 
   /**
-   * Persist a refused transition and throw a typed error carrying its stable
-   * code. The stored order status is never touched; only the audit trail
-   * (`order_events`) grows.
-   */
-  private async rejectTransition(info: TransitionRejectionInfo): Promise<never> {
-    await this.persistRejection(info);
-    throw new OrderTransitionRejectedError(info);
-  }
-
-  /**
-   * Record a refused transition in the audit trail: one `transition_rejected`
-   * event, one metric sample, one log line. The order row is left alone.
+   * Validate that the coordinator may build a claim transaction for
+   * `orderId` on behalf of `resolverAddress`.
    *
-   * `noisy` is false for an identical redelivery, which is normal for chain
-   * listeners and only worth a debug line (the metric still counts it).
+   * Throws `OrderValidationError` when:
+   *  - The order does not exist or is not in a claimable state.
+   *  - The resolver registry is configured and the resolver address is
+   *    not currently active (never registered, or removed).
+   *
+   * Returns the order row so the caller can assemble the transaction
+   * without a second DB round-trip.
    */
-  private async persistRejection(
-    info: TransitionRejectionInfo,
-    { noisy = true }: { noisy?: boolean } = {}
-  ): Promise<void> {
-    await this.repo.recordRejectedTransition({
-      publicId: info.publicId,
-      from: info.from,
-      to: info.to,
-      action: info.action,
-      code: info.code,
-      reason: info.reason,
-      txHash: info.txHash ?? null,
-      writer: info.writer
-    });
-    illegalOrderTransitions.inc({ code: info.code });
-    const fields = {
-      publicId: info.publicId,
-      from: info.from,
-      to: info.to,
-      action: info.action,
-      code: info.code,
-      writer: info.writer,
-      txHash: info.txHash ?? null
-    };
-    if (noisy) {
-      this.log.warn(fields, "refused illegal order transition");
-    } else {
-      this.log.debug(fields, "step already applied, refusing the repeat");
+  async buildClaim(orderId: string, resolverAddress: string): Promise<OrderRow> {
+    const order = await this.repo.findByPublicId(orderId);
+    if (!order) throw new OrderValidationError(`unknown order ${orderId}`);
+
+    if (order.status !== "dst_locked") {
+      throw new OrderValidationError(
+        `order ${orderId} is not in dst_locked state (current: ${order.status})`
+      );
     }
-  }
 
-  /**
-   * Apply one legal edge, refusing (and recording) anything else.
-   *
-   * Order of operations per event:
-   *   1. load the order,
-   *   2. if it is already in the target status, decide redelivery vs conflict,
-   *   3. ask the state machine whether the edge is legal,
-   *   4. only then write.
-   */
-  private async advance(request: AdvanceRequest): Promise<void> {
-    const order = await this.repo.findByPublicId(request.publicId);
-    if (!order) throw new OrderValidationError(`unknown order ${request.publicId}`);
-
-    const to = ACTION_TARGET_STATUS[request.action];
-    const writer = request.writer ?? ORDER_SERVICE_WRITER;
-
-    if (order.status === to) {
-      const redelivery = request.isSameStep ? request.isSameStep(order) : true;
-      const code = redelivery
-        ? ORDER_FAILURE_CODES.REPEATED_STEP
-        : ORDER_FAILURE_CODES.CONFLICTING_STEP;
-      const info: TransitionRejectionInfo = {
-        publicId: request.publicId,
-        from: order.status,
-        to,
-        action: request.action,
-        code,
-        reason: describeTransitionFailure(code, order.status, to),
-        txHash: request.txHash ?? null,
-        writer
-      };
-      if (redelivery) {
-        // At-least-once delivery is normal for chain events: the step is
-        // already applied, so record the repeat but neither move the order
-        // nor fail the caller.
-        await this.persistRejection(info, { noisy: false });
-        return;
+    if (this.resolverRegistry) {
+      const active = await this.resolverRegistry.isActive(resolverAddress);
+      if (!active) {
+        throw new OrderValidationError(
+          `resolver ${resolverAddress} is not registered or has been removed from the registry`
+        );
       }
-      return this.rejectTransition(info);
+      this.log.debug({ orderId, resolverAddress }, "resolver registry check passed");
     }
 
-    const assessment = evaluateTransition(order.status, to, request.action);
-    if (!assessment.allowed) {
-      return this.rejectTransition({
-        publicId: request.publicId,
-        from: order.status,
-        to,
-        action: request.action,
-        code: assessment.code ?? ORDER_FAILURE_CODES.NOT_ALLOWED,
-        reason: assessment.reason ?? describeTransitionFailure(ORDER_FAILURE_CODES.NOT_ALLOWED, order.status, to),
-        txHash: request.txHash ?? null,
-        writer
-      });
-    }
-
-    await request.apply(order, to);
-    this.log.info(
-      {
-        publicId: order.publicId,
-        from: order.status,
-        to,
-        action: request.action,
-        writer,
-        ...request.logFields
-      },
-      request.logMessage
-    );
-    ordersTotal.inc({ status: to });
+    return order;
   }
 }
 
