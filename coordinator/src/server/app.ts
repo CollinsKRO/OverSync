@@ -21,6 +21,8 @@ export interface AppDeps {
   orders: OrderService;
   secrets: SecretService;
   quotes: QuoteService;
+  /** Deployment network. Pagination cursors are bound to it. */
+  network?: "testnet" | "mainnet";
 }
 
 export function createApp(deps: AppDeps): Express {
@@ -45,17 +47,8 @@ export function createApp(deps: AppDeps): Express {
   const readinessWindowMs = Number(process.env.COORDINATOR_READINESS_RATE_WINDOW_MS ?? 60_000);
   app.use(healthRoutes({ limit: readinessLimit, windowMs: readinessWindowMs }));
   app.use(metricsRoutes());
-  app.use("/api", ordersRoutes(deps.orders));
-  app.use(
-    "/api",
-    secretsRoutes(deps.secrets, {
-      cors: createStrictCorsMiddleware(deps.corsOrigins),
-      rateLimit: createReadinessRateLimiter({
-        limit: readinessLimit,
-        windowMs: readinessWindowMs
-      })
-    })
-  );
+  app.use("/api", ordersRoutes(deps.orders, { network: deps.network }));
+  app.use("/api", secretsRoutes(deps.secrets));
   app.use("/api", quotesRoutes(deps.quotes));
   app.use("/api", orderMetricsRoutes(deps.orders));
   // 413 / 400 handler — catches oversized request bodies and malformed JSON before the generic error handler.

@@ -387,7 +387,9 @@ describe("GET /api/orders/history (cursor pagination)", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.pagination.limit).toBe(50);
-    expect(res.body.pagination.cursor).toBeNull();
+    // The keyset contract reports forward progress only; it does not echo the
+    // request cursor back the way the offset-based route did.
+    expect(res.body.pagination.cursor).toBeUndefined();
     expect(res.body.pagination.nextCursor).toBeNull();
     expect(res.body.pagination.hasMore).toBe(false);
     expect(res.body.transactions).toHaveLength(1);

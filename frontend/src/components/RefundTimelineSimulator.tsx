@@ -179,6 +179,7 @@ export function RefundTimelineSimulator() {
         </div>
       </div>
       {/* Direction badge */}
+
       <div className="mb-4 flex items-center gap-2">
         <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs font-medium text-white">
           {srcChain}
@@ -188,8 +189,8 @@ export function RefundTimelineSimulator() {
           {dstChain}
         </span>
       </div>
-
       {/* Timelocks */}
+
       <div className="mb-4 space-y-2">
         {timelockStatus(ex.sourceTimelock, `${srcChain} timelock expiry`, `${srcAsset} refund available`)}
         {timelockStatus(ex.destinationTimelock, `${dstChain} timelock expiry`, `${dstAsset} claim available`)}
@@ -205,6 +206,7 @@ export function RefundTimelineSimulator() {
         </div>
       </div>
       {/* Claim and refund info */}
+
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
         <div className="rounded-lg bg-emerald-500/5 border border-emerald-500/20 px-3 py-2">
           <p className="text-xs font-medium text-emerald-400 mb-1">Claimable by</p>

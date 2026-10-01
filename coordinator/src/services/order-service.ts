@@ -44,8 +44,8 @@ const ZERO_HASHLOCK = "0x" + "0".repeat(64);
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const STELLAR_ADDRESS = /^G[A-Z2-7]{55}$/;
 
-/** Writer label used when a caller does not identify itself. */
-export const ORDER_SERVICE_WRITER = "order-service";
+/** Page size used when a caller asks for history without naming a limit. */
+const DEFAULT_HISTORY_LIMIT = 50;
 
 export const announceSchema = z.object({
   direction: z.enum(["eth_to_xlm", "xlm_to_eth"]),
@@ -269,22 +269,21 @@ interface AdvanceRequest {
   get(publicId: string): Promise<OrderRow | null> {
     return this.repo.findByPublicId(publicId);
   }
+  /**
+   * Cursor-based history page. `before` is the validated keyset from the
+   * previous page; omit it for the first page. `limit` defaults to a full page
+   * so a bare `history(address)` still works for non-paginated callers.
+   */
+  history(
+    address: string,
+    limit = DEFAULT_HISTORY_LIMIT,
+    before?: { createdAt: number; publicId: string }
+  ): Promise<OrderRow[]> {
+    return this.repo.findByAddressPage(address, limit, before);
+  }
 
   getTransitions(publicId: string): Promise<OrderTransitionSummary[]> {
     return this.repo.getTransitions(publicId);
-  }
-
-  /**
-   * Transitions the state machine refused for an order, with their stable
-   * failure code. Queryable so an operator can see that a late listener event
-   * or a repeated client call was refused and why the status did not move.
-   */
-  getRejectedTransitions(publicId: string): Promise<OrderRejectedTransition[]> {
-    return this.repo.getRejectedTransitions(publicId);
-  }
-
-  history(address: string, limit?: number, offset?: number): Promise<OrderRow[]> {
-    return this.repo.findByAddress(address, limit, offset);
   }
 
   findByHashlock(hashlock: string): Promise<OrderRow | null> {
