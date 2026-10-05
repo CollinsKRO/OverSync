@@ -12,9 +12,12 @@ vi.mock('@stellar/stellar-sdk', () => ({
   Memo: { text: vi.fn() },
 }));
 
-vi.mock('../config/networks', () => ({
-  isTestnet: vi.fn(() => true),
-  getCurrentNetwork: vi.fn(() => ({
+vi.mock('../config/networks', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../config/networks')>();
+  return {
+    ...actual,
+    isTestnet: vi.fn(() => true),
+    getCurrentNetwork: vi.fn(() => ({
     ethereum: {
       id: 11155111,
       name: 'sepolia',
@@ -33,15 +36,20 @@ vi.mock('../config/networks', () => ({
       testnet: true,
     },
   })),
-}));
+  };
+});
 
 vi.mock('../lib/parseHtlcReceipt', () => ({
   parseHtlcReceipt: vi.fn(() => null),
 }));
 
-vi.mock('../lib/sanitizeAmountInput', () => ({
-  sanitizeAmountInput: vi.fn((val: string) => val),
-}));
+vi.mock('../lib/sanitizeAmountInput', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/sanitizeAmountInput')>();
+  return {
+    ...actual,
+    sanitizeAmountInput: vi.fn((val: string) => val),
+  };
+});
 
 // Mock the backend status hook so we can drive readiness from tests.
 const useBackendStatusMock = vi.fn();
@@ -49,7 +57,7 @@ vi.mock('../lib/useBackendStatus', () => ({
   useBackendStatus: (...args: unknown[]) => useBackendStatusMock(...args),
 }));
 
-const nullSigner = vi.fn().mockResolved('');
+const nullSigner = vi.fn().mockResolvedValue('');
 
 const testnetState: NetworkModeState = {
   mode: 'testnet',
@@ -103,7 +111,7 @@ describe('BridgeForm network mismatch guardrails', () => {
     Object.defineProperty(window, 'ethereum', {
       writable: true,
       value: {
-        request: vi.fn().mockResolved('0xaa36a7'),
+        request: vi.fn().mockResolvedValue('0xaa36a7'),
         selectedAddress: '0x1234567890123456789012345678901234567890',
       },
     });
@@ -304,7 +312,7 @@ describe('BridgeForm coordinator health gating', () => {
     Object.defineProperty(window, 'ethereum', {
       writable: true,
       value: {
-        request: vi.fn().mockResolved('0xaa36a7'),
+        request: vi.fn().mockResolvedValue('0xaa36a7'),
         selectedAddress: '0x1234567890123456789012345678901234567890',
       },
     });
@@ -358,7 +366,7 @@ describe('BridgeForm coordinator health gating', () => {
   });
 
   test('wake action does not post an order', () => {
-    const fetchSpy = vi.spyOn(global, 'fetch').mockResolved({
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({
       ok: true,
       json: async () => ({ status: 'ready' }),
     } as Response);
@@ -421,7 +429,7 @@ describe('BridgeForm coordinator health gating', () => {
   });
 
   test('wake calls health again and not the order route', () => {
-    const fetchSpy = vi.spyOn(global, 'fetch').mockResolved({
+    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({
       ok: true,
       json: async () => ({ status: 'ready' }),
     } as Response);
