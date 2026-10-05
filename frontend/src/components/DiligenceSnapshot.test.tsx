@@ -2,6 +2,7 @@ import React from 'react';
 import { render, screen } from '@testing-library/react';
 import { DiligenceSnapshot } from './DiligenceSnapshot';
 import { DeploymentContext } from '../context/DeploymentContext';
+import { buildDeploymentRecord } from '../config/deployment';
 
 const mockDeploymentRecord = {
   registryAddress: '0x1234567890123456789012345678901234567890',

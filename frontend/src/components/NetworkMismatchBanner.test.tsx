@@ -4,9 +4,13 @@ import NetworkMismatchBanner from './NetworkMismatchBanner';
 import { vi } from 'vitest';
 
 // Mock isMainnetEnabled
-vi.mock('../config/networks', () => ({
-  isMainnetEnabled: vi.fn(() => true),
-}));
+vi.mock('../config/networks', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../config/networks')>();
+  return {
+    ...actual,
+    isMainnetEnabled: vi.fn(() => true),
+  };
+});
 
 const mockNetworkState = {
   mode: 'testnet' as const,
