@@ -29,6 +29,12 @@ export interface PriceQuote {
   issuedAt: number;
   /** Unix ms after which this quote must not be used to fill an order. */
   expiresAt: number;
+  /**
+   * Source amount this quote was issued for, as a base-unit integer
+   * string (e.g. wei). When set, an order must announce exactly this
+   * `srcAmount` or it is rejected.
+   */
+  amountBaseUnits?: string;
   /** Order terms accepted with this quote, when it has been used to announce an order. */
   terms?: {
     fromAsset: string;
@@ -37,6 +43,64 @@ export interface PriceQuote {
     fromNetwork: string;
     toNetwork: string;
   };
+}
+
+export class AmountParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AmountParseError";
+  }
+}
+
+export class QuoteAmountMismatchError extends Error {
+  constructor(
+    public readonly quoteId: string,
+    public readonly quotedAmount: string,
+    public readonly orderAmount: string
+  ) {
+    super(`Quote ${quoteId} was issued for ${quotedAmount} base units, order announced ${orderAmount}`);
+    this.name = "QuoteAmountMismatchError";
+  }
+}
+
+const BASE_UNIT_INTEGER = /^(0|[1-9]\d*)$/;
+const DECIMAL_AMOUNT = /^(\d+)(?:\.(\d*))?$|^\.(\d+)$/;
+
+/**
+ * Parse a user-entered decimal amount into token base units using only
+ * string/BigInt arithmetic (no floating point). This is the same
+ * algorithm as `parseAmountToBaseUnits` in
+ * `frontend/src/lib/sanitizeAmountInput.ts`, so the form and the
+ * coordinator always agree on the integer.
+ *
+ * Rejects empty input, signs, exponents, and more fractional digits than
+ * the asset's `decimals` allows (never rounds or truncates).
+ */
+export function parseAmountToBaseUnits(input: string, decimals: number): bigint {
+  if (!Number.isInteger(decimals) || decimals < 0) {
+    throw new AmountParseError(`invalid decimals: ${decimals}`);
+  }
+  const text = input.trim();
+  const m = DECIMAL_AMOUNT.exec(text);
+  if (!m) {
+    throw new AmountParseError(`amount must be a non-negative decimal: "${input}"`);
+  }
+  const whole = m[1] ?? "0";
+  const frac = m[2] ?? m[3] ?? "";
+  if (frac.length > decimals) {
+    throw new AmountParseError(
+      `amount has ${frac.length} fractional digits, asset allows ${decimals}`
+    );
+  }
+  return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(frac.padEnd(decimals, "0") || "0");
+}
+
+/** Validate a base-unit integer string (as sent by the form) and return it canonicalised. */
+export function parseBaseUnitInteger(value: string): string {
+  if (!BASE_UNIT_INTEGER.test(value)) {
+    throw new AmountParseError(`amount must be a base-unit integer string: "${value}"`);
+  }
+  return BigInt(value).toString();
 }
 
 export class QuoteExpiredError extends Error {
@@ -97,10 +161,22 @@ export class QuoteService {
    * The returned object always has a unique `quoteId` so callers
    * can reference it when announcing an order.
    */
-  async quoteEthXlm(terms: QuoteTerms): Promise<PriceQuote> {
+  async quoteEthXlm(
+    opts: Partial<QuoteTerms> & { amountBaseUnits?: string } = {}
+  ): Promise<PriceQuote> {
+    const amountBaseUnits =
+      opts.amountBaseUnits === undefined ? undefined : parseBaseUnitInteger(opts.amountBaseUnits);
+    const terms: QuoteTerms = {
+      srcChain: opts.srcChain ?? "ethereum",
+      srcAsset: opts.srcAsset ?? "native",
+      srcAmount: opts.srcAmount ?? amountBaseUnits ?? "0",
+      dstChain: opts.dstChain ?? "stellar",
+      dstAsset: opts.dstAsset ?? "native",
+      dstAmount: opts.dstAmount ?? "0"
+    };
     const cached = this.priceCache.get("ETH-XLM");
     if (cached && this.now() < cached.expiresAt) {
-      return this.issueQuote(terms, cached.srcUsd, cached.dstUsd, "cache", cached.expiresAt);
+      return this.issueQuote(terms, cached.srcUsd, cached.dstUsd, "cache", cached.expiresAt, undefined, amountBaseUnits);
     }
 
     let ethUsd: string | null = null;
@@ -124,7 +200,7 @@ export class QuoteService {
     const issuedAt = this.now();
     const expiresAt = issuedAt + this.cacheTtlMs;
     this.priceCache.set("ETH-XLM", { srcUsd: ethUsd, dstUsd: xlmUsd, expiresAt });
-    return this.issueQuote(terms, ethUsd, xlmUsd, source, expiresAt, issuedAt);
+    return this.issueQuote(terms, ethUsd, xlmUsd, source, expiresAt, issuedAt, amountBaseUnits);
   }
 
   /**
@@ -228,7 +304,8 @@ export class QuoteService {
     dstUsd: string | null,
     source: PriceQuote["source"],
     expiresAt: number,
-    issuedAt = this.now()
+    issuedAt = this.now(),
+    amountBaseUnits?: string
   ): PriceQuote {
     const quote: PriceQuote = {
       ...terms,
@@ -238,7 +315,8 @@ export class QuoteService {
       dstUsd,
       source,
       issuedAt,
-      expiresAt
+      expiresAt,
+      ...(amountBaseUnits !== undefined ? { amountBaseUnits } : {})
     };
     this.quotes.set(quote.quoteId, quote);
     this.log.debug({ quoteId: quote.quoteId, source }, "quote issued");

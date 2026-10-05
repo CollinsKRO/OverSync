@@ -1,7 +1,11 @@
 import type { FreshnessResult } from '../lib/orderFreshness';
 
 interface Props {
-  freshness: FreshnessResult;
+  freshness?: FreshnessResult;
+  isStale?: boolean;
+  freshnessError?: string | null;
+  onRetry?: () => void;
+  isRetrying?: boolean;
 }
 
 /**
@@ -16,7 +20,38 @@ interface Props {
  *   • No action required from the user unless they can refund
  *   • Visually distinct from the refund buttons (different palette)
  */
-export default function OrderStaleBanner({ freshness }: Props) {
+export default function OrderStaleBanner({
+  freshness,
+  isStale,
+  freshnessError,
+  onRetry,
+  isRetrying
+}: Props) {
+  // Legacy props path (used by existing tests and older callers).
+  if (freshness === undefined) {
+    if (!isStale && !freshnessError) return null;
+    if (freshnessError) {
+      return (
+        <div role="alert">
+          <p>Could not verify order freshness</p>
+          <p>{freshnessError}</p>
+          <p>The restored order is still displayed</p>
+          {onRetry && (
+            <button type="button" onClick={onRetry} disabled={isRetrying}>
+              {isRetrying ? "Retrying..." : "Retry freshness"}
+            </button>
+          )}
+        </div>
+      );
+    }
+    return (
+      <div role="alert">
+        <p>Order is stale or expired</p>
+        <p>Claim and refund actions are disabled</p>
+      </div>
+    );
+  }
+
   if (freshness.label === 'fresh') return null;
 
   const config = BANNER_CONFIG[freshness.label];

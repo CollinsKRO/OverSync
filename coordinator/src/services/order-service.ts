@@ -22,7 +22,13 @@ import {
   type OrderTransitionAction
 } from "../state-machine/order-machine.js";
 import { illegalOrderTransitions, ordersTotal } from "../metrics.js";
-import { QuoteService, QuoteExpiredError, QuoteNotFoundError } from "./quote-service.js";
+import {
+  QuoteService,
+  QuoteExpiredError,
+  QuoteNotFoundError,
+  QuoteAmountMismatchError,
+  QuoteTermsMismatchError
+} from "./quote-service.js";
 import { loadConfig } from "../config.js";
 import {
   validateTimelocksAtCreation,
@@ -86,6 +92,21 @@ export class OrderValidationError extends Error {
     super(message);
     this.name = "OrderValidationError";
     this.code = code;
+  }
+}
+
+/**
+ * A quote-gated announce refusal. Extends `OrderValidationError` so service
+ * callers see a validation error, while the HTTP route maps `quoteCode` to
+ * the stable `quote_expired` / `quote_mismatch` contract.
+ */
+export class QuoteGateError extends OrderValidationError {
+  readonly quoteCode: "quote_expired" | "quote_mismatch";
+
+  constructor(quoteCode: QuoteGateError["quoteCode"], message: string) {
+    super(message);
+    this.name = "QuoteGateError";
+    this.quoteCode = quoteCode;
   }
 }
 
@@ -202,6 +223,9 @@ interface AdvanceRequest {
   apply: (order: OrderRow, to: OrderStatus) => Promise<void>;
 }
 
+export class OrderService {
+  private readonly minGapSeconds: number;
+
   constructor(
     private readonly repo: OrdersRepository,
     private readonly log: Logger,
@@ -214,11 +238,25 @@ interface AdvanceRequest {
     this.minGapSeconds = config?.timelockSafetyGapSeconds ?? 600;
   }
 
-  async buildLockOrder(request: LockRequest): Promise<any> {
-    const activeV2Escrow = this.config.getActiveV2Escrow();
+  /**
+   * Record a new order announcement. The coordinator does NOT lock any
+   * funds — it simply records the intent so the order book is visible
+   * to all resolvers and the user can later attach the on-chain
+   * `srcOrderId` once they have locked.
+   *
+   * When `quoteId` is present in the input, it is validated against
+   * the QuoteService before the order is persisted.  Expired or
+   * unknown quoteIds are rejected as `OrderValidationError` so the
+   * error surfaces cleanly to the caller before any chain action is
+   * attempted.
+   */
+  async announce(input: AnnounceInput): Promise<OrderRow> {
+    validateChainAddress(input.srcChain, input.srcAddress);
+    validateChainAddress(input.dstChain, input.dstAddress);
+    validateDirectionAgainstChains(input);
 
-    if (activeV2Escrow && activeV2Escrow.toLowerCase() !== request.target.toLowerCase()) {
-      throw new Error("Legacy bridge lock rejected: v2 escrow active");
+    if (input.hashlock.toLowerCase() === ZERO_HASHLOCK.toLowerCase()) {
+      throw new OrderValidationError("hashlock must not be all zeros");
     }
 
     const hashlock = input.hashlock.toLowerCase() as `0x${string}`;
@@ -229,18 +267,49 @@ interface AdvanceRequest {
         // No QuoteService wired in (e.g. test mode without quotes) — skip.
         this.log.debug({ quoteId: input.quoteId }, "quoteId supplied but no QuoteService wired; skipping freshness check");
       } else {
+        // Quote errors surface as `QuoteGateError` (an `OrderValidationError`
+        // subclass) so service callers see a validation error while the HTTP
+        // route maps `quoteCode` to the stable contract.
         try {
-          this.quoteService.bindOrderTerms(input.quoteId, {
+          const bound = this.quoteService.bindOrderTerms(input.quoteId, {
             fromAsset: input.srcAsset,
             toAsset: input.dstAsset,
             amount: input.srcAmount,
             fromNetwork: input.srcChain,
             toNetwork: input.dstChain
           });
+          // The quote was issued for concrete terms: amount or network drift
+          // must be rejected before any order is persisted.
+          if (
+            (bound.srcAmount !== undefined &&
+              bound.srcAmount !== "0" &&
+              input.srcAmount !== bound.srcAmount) ||
+            (bound.amountBaseUnits !== undefined && input.srcAmount !== bound.amountBaseUnits)
+          ) {
+            throw new QuoteGateError(
+              "quote_mismatch",
+              `Order srcAmount ${input.srcAmount} does not match quoted amount`
+            );
+          }
+          if (
+            (bound.srcChain !== undefined && input.srcChain !== bound.srcChain) ||
+            (bound.dstChain !== undefined && input.dstChain !== bound.dstChain) ||
+            (bound.srcAsset !== undefined && input.srcAsset !== bound.srcAsset) ||
+            (bound.dstAsset !== undefined && input.dstAsset !== bound.dstAsset) ||
+            (bound.dstAmount !== undefined &&
+              bound.dstAmount !== "0" &&
+              input.dstAmount !== bound.dstAmount)
+          ) {
+            throw new QuoteGateError("quote_mismatch", `Order terms do not match quote ${input.quoteId}`);
+          }
           this.log.debug({ quoteId: input.quoteId }, "quote freshness confirmed");
         } catch (err) {
+          if (err instanceof QuoteGateError) throw err;
           if (err instanceof QuoteExpiredError || err instanceof QuoteNotFoundError) {
-            throw new OrderValidationError(err.message);
+            throw new QuoteGateError("quote_expired", err.message);
+          }
+          if (err instanceof QuoteAmountMismatchError || err instanceof QuoteTermsMismatchError) {
+            throw new QuoteGateError("quote_mismatch", err.message);
           }
           throw err;
         }
@@ -379,21 +448,156 @@ interface AdvanceRequest {
     });
   }
 
-  async recordSecret(publicId: string, preimage: string, txHash: string): Promise<void> {
-    const order = await this.repo.findByPublicId(publicId);
-    if (!order) throw new OrderValidationError(`unknown order ${publicId}`);
-    if (order.status === "secret_revealed") {
-      // Idempotent: same preimage for the same order is always accepted,
-      // even if the txHash differs (e.g. a second chain event observer).
-      if (order.preimage === preimage) return;
-      throw new StaleOrderEventError(`conflicting secret event for ${publicId}`);
+  /**
+   * The single writer for every lifecycle edge. Validates the edge with the
+   * state machine, persists refused attempts with a stable code, and treats
+   * an identical redelivery as idempotent.
+   */
+  private async advance(req: AdvanceRequest): Promise<void> {
+    const order = await this.repo.findByPublicId(req.publicId);
+    if (!order) throw new OrderValidationError(`unknown order ${req.publicId}`);
+    const to = ACTION_TARGET_STATUS[req.action];
+    const writer = req.writer ?? "order-service";
+    const txHash = req.txHash ?? null;
+
+    const assessment = evaluateTransition(order.status, to, req.action);
+    if (assessment.allowed) {
+      await req.apply(order, to);
+      this.log.info(
+        { publicId: req.publicId, from: order.status, to, ...(req.logFields ?? {}) },
+        req.logMessage
+      );
+      ordersTotal.inc({ status: to });
+      return;
     }
-    if (!canTransition(order.status, "secret_revealed")) {
-      throw new StaleOrderEventError(`stale secret event for order in status ${order.status}`);
+
+    // Already in the target status: identical payload = idempotent redelivery,
+    // anything else = conflicting repeat.
+    if (order.status === to) {
+      if (req.isSameStep?.(order)) {
+        await this.repo.recordRejectedTransition({
+          publicId: req.publicId,
+          from: order.status,
+          to,
+          action: req.action,
+          code: ORDER_FAILURE_CODES.REPEATED_STEP,
+          reason: describeTransitionFailure(ORDER_FAILURE_CODES.REPEATED_STEP, order.status, to),
+          txHash,
+          writer
+        });
+        illegalOrderTransitions.inc({ code: ORDER_FAILURE_CODES.REPEATED_STEP });
+        return;
+      }
+      const code = ORDER_FAILURE_CODES.CONFLICTING_STEP;
+      await this.repo.recordRejectedTransition({
+        publicId: req.publicId,
+        from: order.status,
+        to,
+        action: req.action,
+        code,
+        reason: describeTransitionFailure(code, order.status, to),
+        txHash,
+        writer
+      });
+      illegalOrderTransitions.inc({ code });
+      throw new OrderTransitionRejectedError({
+        from: order.status,
+        to,
+        action: req.action,
+        code,
+        reason: describeTransitionFailure(code, order.status, to),
+        writer,
+        publicId: req.publicId,
+        txHash
+      });
     }
-    await this.repo.recordSecretRevealed({ publicId, preimage, txHash });
-    this.log.info({ publicId }, "secret recorded");
-    ordersTotal.inc({ status: "secret_revealed" });
+
+    const code = assessment.code ?? ORDER_FAILURE_CODES.NOT_ALLOWED;
+    const reason = assessment.reason ?? describeTransitionFailure(code, order.status, to);
+    await this.repo.recordRejectedTransition({
+      publicId: req.publicId,
+      from: order.status,
+      to,
+      action: req.action,
+      code,
+      reason,
+      txHash,
+      writer
+    });
+    illegalOrderTransitions.inc({ code });
+    throw new OrderTransitionRejectedError({
+      from: order.status,
+      to,
+      action: req.action,
+      code,
+      reason,
+      writer,
+      publicId: req.publicId,
+      txHash
+    });
+  }
+
+  async recordSecret(
+    publicId: string,
+    preimage: string,
+    txHash: string,
+    writer?: string
+  ): Promise<void> {
+    await this.advance({
+      publicId,
+      action: "secret",
+      txHash,
+      writer,
+      isSameStep: (order) => order.preimage === preimage,
+      logMessage: "secret recorded",
+      apply: async () => {
+        await this.repo.recordSecretRevealed({ publicId, preimage, txHash });
+      }
+    });
+  }
+
+  async recordClaim(
+    input: { publicId: string; txHash: string; writer?: string }
+  ): Promise<void> {
+    await this.advance({
+      publicId: input.publicId,
+      action: "claim",
+      txHash: input.txHash,
+      writer: input.writer,
+      isSameStep: () => true,
+      logMessage: "claim recorded",
+      logFields: { txHash: input.txHash },
+      apply: async () => {
+        await this.repo.setStatus(input.publicId, "completed", input.txHash);
+      }
+    });
+  }
+
+  async recordRefund(
+    inputOrPublicId: { publicId: string; txHash: string; writer?: string } | string,
+    txHash?: string,
+    writer?: string
+  ): Promise<void> {
+    const input =
+      typeof inputOrPublicId === "string"
+        ? { publicId: inputOrPublicId, txHash: txHash ?? "", writer }
+        : inputOrPublicId;
+    await this.advance({
+      publicId: input.publicId,
+      action: "refund",
+      txHash: input.txHash,
+      writer: input.writer,
+      isSameStep: () => true,
+      logMessage: "refund recorded",
+      logFields: { txHash: input.txHash },
+      apply: async () => {
+        await this.repo.setStatus(input.publicId, "refunded", input.txHash);
+      }
+    });
+  }
+
+  async getRejectedTransitions(publicId: string) {
+    return this.repo.getRejectedTransitions(publicId);
   }
 
   async getOrderMetrics(): Promise<OrderMetrics> {
@@ -409,6 +613,7 @@ interface AdvanceRequest {
       publicId,
       action,
       writer,
+      isSameStep: () => true,
       logMessage: "status updated",
       apply: async () => {
         await this.repo.setStatus(publicId, status);

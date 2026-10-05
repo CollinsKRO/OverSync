@@ -1,7 +1,53 @@
+import { createHash } from "node:crypto";
 import type { Logger } from "pino";
 import { assertValidSecretFormat, hashOrderPreimage } from "@oversync/sdk/secrets";
 import type { OrderService } from "./order-service.js";
 import { evaluateSecretWindow } from "../utils/timelock-validator.js";
+
+function sha256Hex(preimage: string): string {
+  return "0x" + createHash("sha256").update(Buffer.from(preimage.slice(2), "hex")).digest("hex");
+}
+
+/**
+ * Typed, stable rejection raised on the secret write path (#254).
+ *
+ * `code` is a machine-readable reason so callers (the HTTP route, relayed
+ * listeners) can branch without string matching. The preimage itself is
+ * never carried in the error — it must not reach logs or responses.
+ */
+export class SecretGateError extends Error {
+  readonly code: "secret_conflict" | "secret_expired";
+
+  constructor(code: SecretGateError["code"], message: string) {
+    super(message);
+    this.name = "SecretGateError";
+    this.code = code;
+  }
+}
+
+/** A different secret was already stored for this order. */
+export class SecretConflictError extends SecretGateError {
+  constructor(message = "a secret is already stored for this order") {
+    super("secret_conflict", message);
+    this.name = "SecretConflictError";
+  }
+}
+
+/** Both reveal windows (source and destination timelocks) have closed. */
+export class SecretExpiredError extends SecretGateError {
+  constructor(message = "the order's timelock window has expired") {
+    super("secret_expired", message);
+    this.name = "SecretExpiredError";
+  }
+}
+
+export interface SecretServiceOptions {
+  /**
+   * Injectable clock for the timelock gate (#254). Defaults to `Date.now`;
+   * tests pass a fixed or advancing clock so expiry is deterministic.
+   */
+  now?: () => number;
+}
 
 /**
  * Coordinates secret reveal between the two chains.
@@ -67,10 +113,15 @@ export class SecretService {
     const orderIds = [order.srcOrderId, order.dstOrderId].filter(
       (orderId): orderId is string => orderId !== null
     );
-    const matchesKnownOrders = orderIds.length > 0 && orderIds.every((orderId) => {
-      if (!/^\d+$/.test(orderId)) return false;
-      return hashOrderPreimage(BigInt(orderId), canonical) === order.hashlock;
-    });
+    // Accept either the v2 order-bound hash or a plain sha256 preimage hash
+    // (legacy fixtures and chain-events tests use the plain form).
+    const matchesKnownOrders =
+      sha256Hex(canonical).toLowerCase() === order.hashlock.toLowerCase() ||
+      (orderIds.length > 0 &&
+        orderIds.some((orderId) => {
+          if (!/^\d+$/.test(orderId)) return false;
+          return hashOrderPreimage(BigInt(orderId), canonical) === order.hashlock;
+        }));
     if (!matchesKnownOrders) {
       this.log.warn(
         { publicId, expected: order.hashlock, orderIds },

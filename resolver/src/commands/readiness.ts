@@ -237,26 +237,38 @@ export async function assessReadiness(): Promise<ReadinessResult> {
   });
 
   // ===== Resolver network agreement (EVM + Soroban match NETWORK_MODE) =====
-  const evmRpcUrl = resolveEthereumRpcUrl(network);
-  const sorobanRpcUrl =
-    process.env.SOROBAN_RPC_URL?.trim() ||
-    (network === "mainnet" ? "https://mainnet.sorobanrpc.com" : "https://soroban-testnet.stellar.org");
-  const sorobanNetworkPassphrase = network === "mainnet"
-    ? "Public Global Stellar Network ; September 2015"
-    : "Test SDF Network ; September 2015";
+  try {
+    const evmRpcUrl = resolveEthereumRpcUrl(network);
+    const sorobanRpcUrl =
+      process.env.SOROBAN_RPC_URL?.trim() ||
+      (network === "mainnet" ? "https://mainnet.sorobanrpc.com" : "https://soroban-testnet.stellar.org");
+    const sorobanNetworkPassphrase = network === "mainnet"
+      ? "Public Global Stellar Network ; September 2015"
+      : "Test SDF Network ; September 2015";
 
-  const resolverAgreement = await checkResolverNetworkAgreement(
-    network,
-    evmRpcUrl,
-    sorobanRpcUrl,
-    sorobanNetworkPassphrase
-  );
-  checks.push({
-    id: "resolver-network-agreement",
-    label: "Resolver EVM and Soroban networks agree with NETWORK_MODE",
-    status: resolverAgreement.status === "ok" ? "ok" : "fail",
-    detail: resolverAgreement.detail
-  });
+    const resolverAgreement = await checkResolverNetworkAgreement(
+      network,
+      evmRpcUrl,
+      sorobanRpcUrl,
+      sorobanNetworkPassphrase
+    );
+    checks.push({
+      id: "resolver-network-agreement",
+      label: "Resolver EVM and Soroban networks agree with NETWORK_MODE",
+      status: resolverAgreement.status === "ok" ? "ok" : "fail",
+      detail: resolverAgreement.detail
+    });
+  } catch (err: any) {
+    // Credentialed or otherwise invalid RPC URLs must surface as a failed
+    // check, never as an uncaught exception (passwords stay redacted by
+    // redactRpcUrl upstream; only the username is mentioned).
+    checks.push({
+      id: "resolver-network-agreement",
+      label: "Resolver EVM and Soroban networks agree with NETWORK_MODE",
+      status: "fail",
+      detail: `RPC URL validation failed: ${err?.message ?? String(err)}`
+    });
+  }
 
   const sorobanRegistry = process.env[sorobanRegistryEnv];
   const sorobanRegistryOk = !!sorobanRegistry && SOROBAN_CONTRACT_RE.test(sorobanRegistry);

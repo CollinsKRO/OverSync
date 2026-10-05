@@ -1,7 +1,14 @@
 import { Router, type Request } from "express";
 import { z } from "zod";
 import type { OrderRow, OrderSnapshot } from "../../persistence/orders-repo.js";
-import { announceSchema, OrderService, OrderValidationError } from "../../services/order-service.js";
+import {
+  announceSchema,
+  OrderService,
+  OrderValidationError,
+  QuoteGateError,
+  isTransitionRejection
+} from "../../services/order-service.js";
+import { evaluateRefundEligibility } from "../../utils/timelock-validator.js";
 import {
   encodeHistoryCursor,
   validateHistoryCursor,
@@ -113,6 +120,10 @@ export function ordersRoutes(orders: OrderService, options: OrdersRouteOptions =
     } catch (err) {
       if (err instanceof z.ZodError) {
         res.status(400).json({ error: "validation_error", details: err.errors });
+        return;
+      }
+      if (err instanceof QuoteGateError) {
+        res.status(400).json({ error: err.quoteCode, message: err.message });
         return;
       }
       if (err instanceof OrderValidationError) {

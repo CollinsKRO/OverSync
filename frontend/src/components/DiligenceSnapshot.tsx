@@ -1,6 +1,6 @@
 import React from 'react';
 import { useDeploymentContext } from '../context/DeploymentContext';
-import { NetworkConfig } from '../config/networks';
+import { ETHEREUM_NETWORKS, STELLAR_NETWORKS } from '../config/networks';
 
 interface DiligenceSnapshotProps {
   selfCheckRecord: {
@@ -57,7 +57,9 @@ export const DiligenceSnapshot: React.FC<DiligenceSnapshotProps> = ({ selfCheckR
     );
   }
 
-  const networkConfig = NetworkConfig[deploymentRecord.networkId];
+  const networkConfig: { name?: string } | undefined =
+    (ETHEREUM_NETWORKS as Record<string, { name?: string }>)[deploymentRecord.networkId] ??
+    (STELLAR_NETWORKS as unknown as Record<string, { name?: string }>)[deploymentRecord.networkId];
 
   return (
     <div className="dil-snapshot" data-testid="dil-snapshot-visible">

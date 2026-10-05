@@ -422,7 +422,7 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
         ))}
       </div>
 
-      {cursor && !isLoading && (
+      {nextCursor && !isLoading && (
         <button
           onClick={refreshFromCoordinator}
           disabled={isLoading}

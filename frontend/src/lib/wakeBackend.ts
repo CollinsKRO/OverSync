@@ -5,3 +5,8 @@ export function pingBackendWake(): void {
     // Best-effort — site works without it; order creation also wakes pollers.
   });
 }
+
+/** Alias kept for callers that wake then re-check health. */
+export async function wakeBackend(): Promise<void> {
+  pingBackendWake();
+}

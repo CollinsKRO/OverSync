@@ -4,12 +4,13 @@ import { QuoteExpiredError, QuoteNotFoundError } from "../../services/quote-serv
 import type { QuoteService } from "../../services/quote-service.js";
 
 const quoteTermsSchema = z.object({
-  srcChain: z.enum(["ethereum", "stellar"]),
-  srcAsset: z.string().min(1),
-  srcAmount: z.string().regex(/^\d+$/),
-  dstChain: z.enum(["ethereum", "stellar"]),
-  dstAsset: z.string().min(1),
-  dstAmount: z.string().regex(/^\d+$/)
+  srcChain: z.enum(["ethereum", "stellar"]).optional(),
+  srcAsset: z.string().min(1).optional(),
+  srcAmount: z.string().regex(/^\d+$/).optional(),
+  dstChain: z.enum(["ethereum", "stellar"]).optional(),
+  dstAsset: z.string().min(1).optional(),
+  dstAmount: z.string().regex(/^\d+$/).optional(),
+  amount: z.string().optional()
 });
 
 export function quotesRoutes(quotes: QuoteService): Router {

@@ -321,11 +321,13 @@ export class RecoveryService {
         );
         // Forget the old record so submit() can create a fresh one.
         this.tracker.forget(record.key);
-        // Re-submit with an executor that immediately resolves with the
-        // original result so the duplicate gate is armed.
-        await this.tracker.submit(record.action, () =>
-          Promise.resolve(record.result)
-        );
+        // Re-submit a no-op stage carrying the already-known hash so the
+        // duplicate gate is armed without broadcasting again.
+        const result = record.result as unknown;
+        await this.tracker.submit(record.action, () => ({
+          txHash,
+          broadcast: async () => result as never
+        }));
         report.alreadyConfirmed.push(record.key);
         break;
       }

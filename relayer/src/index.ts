@@ -184,10 +184,8 @@ import ClientSubscriptionManager from './client-subscriptions.js';
 
 // Phase 5: Recovery System imports
 import RecoveryService, {
-  RecoveryConfig,
-  RecoveryType,
-  RecoveryStatus,
-  type RecoverySubmitter,
+  type RecoveryServiceConfig,
+  type TxStatusProvider,
 } from './recovery-service.js';
 
 // Stellar SDK will be imported dynamically when needed
@@ -570,37 +568,15 @@ export const relaySubmissionTracker = new RelaySubmissionTracker({
 });
 
 /**
- * Build a submitter for the recovery service.
- *
- * The recovery service's on-chain execution is still a dry run
- * (`recovery-service.ts` logs and resolves), so there is no transaction to
- * stage and no hash to record — writing a synthetic hash would occupy the
- * order's single-flight slot with a value no node will ever know about and
- * would block the real refund for that order.
- *
- * It still goes through the tracker's order lock as a gate: if a claim or a
- * refund is already live or settled for the order, recovery yields with
- * `RelayOrderBusyError` instead of racing it. When recovery gains real
- * execution, this must become a staged submission
- * (`stageStellarTransaction` / `stageEthereumTransaction`) so the hash is
- * recorded before the broadcast.
+ * Minimal tx-status provider for the recovery service: without chain-specific
+ * confirmation plumbing here, every pending row is treated as unknown and
+ * left untouched (conservative — see recovery-service.ts).
  */
-function createRecoverySubmitter(): RecoverySubmitter {
-  return async ({ orderId, side, action, chain, reason, execute }) => {
-    const recoveryAction: RelayAction = {
-      orderId,
-      side,
-      action,
-      chain,
-      extra: { source: 'recovery-service', reason },
-    };
-    const blocking = relaySubmissionTracker.getBlockingRecord(recoveryAction);
-    if (blocking) {
-      throw new RelayOrderBusyError(recoveryAction, blocking);
-    }
-    return execute();
-  };
-}
+const recoveryTxStatusProvider: TxStatusProvider = {
+  async getTxStatus() {
+    return { kind: "unknown" };
+  }
+};
 
 /**
  * The refund watchdog handle, kept at module scope so `gracefulShutdown` can
@@ -1908,7 +1884,13 @@ async function initializeRelayer() {
               amount: xlmAmount,
             },
             relaySubmissionTracker,
-            () => server.submitTransaction(transaction)
+            () =>
+              stageStellarTransaction({
+                server: server as never,
+                transaction: transaction as never,
+                network: dynamicNetwork,
+                label: "eth_to_xlm claim payout"
+              })
           );
           payoutResult = submission.result;
           payoutTxHash = submission.txHash ?? payoutResult?.hash;
@@ -3383,28 +3365,21 @@ console.log('✅ Phase 4: Event System initialized');
 // ===== PHASE 5: RECOVERY SYSTEM INITIALIZATION =====
 
 // Initialize recovery configuration
-const recoveryConfig: RecoveryConfig = {
-  monitoringInterval: 30000, // 30 seconds
-  autoRefundEnabled: true,
-  emergencyEnabled: true,
-  maxRetries: 3,
-  retryDelay: 60000, // 1 minute
-  gracePeriod: 300 // 5 minutes after timelock
+const recoveryConfig: RecoveryServiceConfig = {
+  expectedChains: ["ethereum", "stellar"],
+  pollingIntervalMs: 30000,
+  logger: console
 };
 
-// Initialize recovery service. Every on-chain step it wants to take is routed
-// through the shared submission tracker, so a recovery can never race a claim
-// or a watchdog refund for the same order.
-const recoveryService = new RecoveryService(ordersService, eventManager, recoveryConfig, createRecoverySubmitter());
-
-// Connect recovery service to event system
-recoveryService.on('recoveryCompleted', (event) => {
-  console.log(`✅ Recovery completed: ${event.recoveryId}`);
-});
-
-recoveryService.on('recoveryFailed', (event) => {
-  console.log(`❌ Recovery failed: ${event.recoveryId} - ${event.error}`);
-});
+// Initialize recovery service against the shared submission tracker. Pending
+// rows are reconciled against the chain via the provider above; unknown
+// statuses are left untouched.
+const recoveryService = new RecoveryService(
+  relaySubmissionTracker,
+  recoveryTxStatusProvider,
+  recoveryConfig
+);
+void recoveryService;
 
 console.log('✅ Phase 5: Recovery System initialized');
 

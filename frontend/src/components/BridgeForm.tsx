@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { 
   Horizon, 
   Asset, 
@@ -13,6 +13,22 @@ import { sanitizeAmountInput, parseAmountToBaseUnits } from '../lib/sanitizeAmou
 import { AlertTriangle, ArrowDownUp, CheckCircle2, Loader2, RefreshCw, Settings2 } from 'lucide-react';
 import { useBackendStatus } from '../lib/useBackendStatus';
 import { wakeBackend } from '../lib/wakeBackend';
+import {
+  type RecoveredOrder,
+  getActiveOrder,
+  setActiveOrder,
+  clearActiveOrder,
+  getActiveOrderId,
+  setActiveOrderId,
+  clearActiveOrderId,
+  isResponseForCurrentOrder,
+  isOrderStale,
+  checkOrderFreshness
+} from '../lib/orderRecovery';
+import NetworkMismatchBanner from './NetworkMismatchBanner';
+import OrderStaleBanner from './OrderStaleBanner';
+import { RefundDialog } from '../features/refund/RefundDialog';
+import type { Address } from 'viem';
 
 // Web3 imports for contract interaction
 declare global {
@@ -30,6 +46,9 @@ export interface BridgeFormProps {
   signStellarTransaction: (xdr: string, networkPassphrase?: string) => Promise<string>;
   /** Network/wallet mismatch detector from App. If omitted, guardrails are skipped. */
   networkState?: NetworkModeState;
+  initialOrderId?: string | null;
+  onClaim?: (order: RecoveredOrder) => Promise<void> | void;
+  onRefund?: (order: RecoveredOrder) => Promise<void> | void;
 }
 
   // Fixed token information
@@ -164,7 +183,15 @@ const API_BASE_URL = import.meta.env.PROD
   : import.meta.env.VITE_API_BASE_URL || PRODUCTION_API_BASE_URL;
 const ENABLE_MOCK_DATA = import.meta.env.VITE_ENABLE_MOCK_DATA === 'true';
 
-export default function BridgeForm({ ethAddress, stellarAddress, signStellarTransaction, networkState }: BridgeFormProps) {
+export default function BridgeForm({
+  ethAddress,
+  stellarAddress,
+  signStellarTransaction,
+  networkState,
+  initialOrderId = null,
+  onClaim,
+  onRefund
+}: BridgeFormProps) {
   const [direction, setDirection] = useState<'eth_to_xlm' | 'xlm_to_eth'>('eth_to_xlm');
   const { status: backendStatus, isReady: backendReady, isLoading: backendLoading, refresh: refreshBackendStatus } = useBackendStatus();
   const [isWakingBackend, setIsWakingBackend] = useState(false);
@@ -333,10 +360,10 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
   const targetNetworkMode: 'testnet' | 'mainnet' =
     order?.networkMode ?? (networkInfo.isTestnet ? 'testnet' : 'mainnet');
 
-  const isWalletNetworkMismatch = Boolean(networkState.hasAnyMismatch);
+  const isWalletNetworkMismatch = Boolean(networkState?.hasAnyMismatch);
   const isOrderNetworkMismatch = Boolean(
-    networkState.hasAnyMismatch ||
-    (order?.networkMode && networkState.mode !== order.networkMode)
+    networkState?.hasAnyMismatch ||
+    (order?.networkMode && networkState?.mode !== order.networkMode)
   );
 
   const handleClaim = async () => {
@@ -657,6 +684,17 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
         console.log('✅ Network is already correct');
       }
 
+      // Parse the amount to base units exactly once, with no floating point.
+      // The coordinator applies the same parse, and this integer (not the raw
+      // text) is what the order request carries.
+      const amountBaseUnits = parseAmountToBaseUnits(amount, fromToken.decimals);
+      if (amountBaseUnits === null || amountBaseUnits === 0n) {
+        alert(`Enter a positive amount with at most ${fromToken.decimals} decimal places.`);
+        setIsSubmitting(false);
+        setStatusMessage('');
+        return;
+      }
+
       // Create order request (used by both testnet and mainnet)
       console.log('📋 BEFORE orderRequest creation:', {
         'AMOUNT_BEFORE_REQUEST': amount,
@@ -664,7 +702,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
         'EXCHANGE_RATE': exchangeRate,
         'DIRECTION': direction
       });
-      
+
       const orderRequest = {
         fromChain: direction === 'eth_to_xlm' ? 'ethereum' : 'stellar',
         toChain: direction === 'eth_to_xlm' ? 'stellar' : 'ethereum',
@@ -1324,8 +1362,8 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
   const backendStatusLabel = useMemo(() => {
     if (backendLoading) return 'Checking coordinator...';
     if (!backendReady) {
-      if (backendStatus === 'down') return 'Coordinator is down';
-      if (backendStatus === 'not-ready') return 'Coordinator is starting up';
+      if (backendStatus === 'unavailable') return 'Coordinator is down';
+      if (backendStatus === 'checking') return 'Coordinator is starting up';
       return 'Coordinator is not ready';
     }
     return null;
@@ -1389,7 +1427,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
     <div className="w-full rounded-[1.25rem] p-4 swap-card-bg swap-card-border md:p-5 lg:p-6">
       {orderCreated ? (
         <div className="space-y-6 text-center">
-          {isOrderNetworkMismatch && (
+          {isOrderNetworkMismatch && networkState && (
             <div className="mb-4 text-left">
               <NetworkMismatchBanner
                 networkState={networkState}
@@ -1401,12 +1439,19 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
 
           <div className="text-left">
             <OrderStaleBanner
-              order={order}
-              isStale={isStale}
-              freshnessError={freshnessError}
-              onRetry={handleRetryFreshness}
-              isRetrying={isCheckingFreshness}
+              freshness={
+                freshnessError
+                  ? { label: "stale", hint: freshnessError }
+                  : isStale
+                    ? { label: "stale", hint: "This order is taking longer than expected." }
+                    : { label: "fresh", hint: "" }
+              }
             />
+            {freshnessError && (
+              <button type="button" onClick={handleRetryFreshness} disabled={isCheckingFreshness}>
+                {isCheckingFreshness ? "Retrying…" : "Retry"}
+              </button>
+            )}
           </div>
 
           <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-emerald-300/25 bg-emerald-300/12 shadow-[0_18px_48px_rgba(16,185,129,0.18)]">
@@ -1476,7 +1521,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
         </div>
       ) : (
         <form onSubmit={handleSubmit} className="space-y-3">
-          {isWalletNetworkMismatch && (
+          {isWalletNetworkMismatch && networkState && (
             <div className="mb-3">
               <NetworkMismatchBanner networkState={networkState} />
             </div>
@@ -1744,6 +1789,7 @@ export default function BridgeForm({ ethAddress, stellarAddress, signStellarTran
 
       {showRefundDialog && order?.src?.orderId && ethAddress && (
         <RefundDialog
+          coordinatorOrderId={order.id}
           userAddress={ethAddress as Address}
           orderId={order.src.orderId}
           timelockUnixSeconds={order.src.timelock ?? 0}

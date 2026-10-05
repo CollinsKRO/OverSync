@@ -194,10 +194,13 @@ contract HTLCEscrow is IHTLCEscrow, ReentrancyGuard {
             if (!resolverRegistry.isActive(msg.sender)) revert ClaimResolverNotRegistered();
         }
 
-        // Verify hashlock. We accept both sha256 and keccak256 digests
-        // so that a Soroban-side counterpart (sha256) and a classic EVM
-        // counterparty (keccak256) can share the same on-chain hashlock.
-        bytes32 sha = sha256(preimage);
+        // Verify hashlock against the order-bound digest
+        // sha256(abi.encodePacked(orderId, preimage)), matching the
+        // Soroban counterpart and the SDK's hashOrderPreimage. The
+        // keccak digest of the raw preimage is still recorded for
+        // cross-chain proofs.
+        if (preimage.length == 0) revert InvalidPreimage();
+        bytes32 sha = sha256(abi.encodePacked(orderId, preimage));
         bytes32 kek = keccak256(preimage);
         if (sha != order.hashlock) revert InvalidPreimage();
 

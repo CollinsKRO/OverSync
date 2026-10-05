@@ -1,4 +1,9 @@
+import { createHash } from "node:crypto";
 import { hashOrderPreimage } from "@oversync/sdk/secrets";
+
+function sha256Hex(preimage: Hex): string {
+  return ("0x" + createHash("sha256").update(Buffer.from(preimage.slice(2), "hex")).digest("hex")).toLowerCase();
+}
 
 export type Hex = `0x${string}`;
 
@@ -100,6 +105,15 @@ abstract class BaseHtlcSim {
 
   advanceTime(seconds: number): void {
     this.now += seconds;
+  }
+
+  setRegistryEnabled(enabled: boolean): void {
+    this.registryEnabled = enabled;
+  }
+
+  setResolverActive(resolver: string, active: boolean): void {
+    if (active) this.activeResolvers.add(resolver.toLowerCase());
+    else this.activeResolvers.delete(resolver.toLowerCase());
   }
 
   nextOrderId(): bigint {
@@ -205,7 +219,8 @@ export class EvmHtlcSim extends BaseHtlcSim implements HtlcSim {
     if (!/^0x(?:[0-9a-fA-F]{2})+$/.test(preimage)) {
       throw new SimError("InvalidPreimage");
     }
-    if (hashOrderPreimage(id, preimage) !== o.hashlock) {
+    const want = o.hashlock.toLowerCase();
+    if (sha256Hex(preimage) !== want && hashOrderPreimage(id, preimage).toLowerCase() !== want) {
       throw new SimError("InvalidPreimage");
     }
     o.status = "Claimed";
@@ -229,7 +244,8 @@ export class SorobanHtlcSim extends BaseHtlcSim implements HtlcSim {
     if (!/^0x(?:[0-9a-fA-F]{2})+$/.test(preimage)) {
       throw new SimError("InvalidPreimage");
     }
-    if (hashOrderPreimage(id, preimage) !== o.hashlock) {
+    const want = o.hashlock.toLowerCase();
+    if (sha256Hex(preimage) !== want && hashOrderPreimage(id, preimage).toLowerCase() !== want) {
       throw new SimError("InvalidPreimage");
     }
     o.status = "Claimed";

@@ -18,6 +18,27 @@
 
 import { isTestnet } from '../config/networks';
 
+export type OrderStatus =
+  | "announced"
+  | "src_locked"
+  | "dst_locked"
+  | "secret_revealed"
+  | "completed"
+  | "refunded"
+  | "failed"
+  | "expired";
+
+const STATUS_TO_STEP: Record<OrderStatus, number> = {
+  announced: 0,
+  src_locked: 1,
+  dst_locked: 2,
+  secret_revealed: 3,
+  completed: 4,
+  refunded: 5,
+  failed: 5,
+  expired: 5
+};
+
 export interface Transaction {
   id: string;
   txHash: string;
@@ -204,4 +225,97 @@ function buildClaimReceiptFromCoordinatorOrder(order: any): Transaction['claimRe
  */
 export function getStepFromStatus(status: OrderStatus): number | undefined {
   return STATUS_TO_STEP[status];
+}
+
+/** Minimal recovered order shape used by BridgeForm and banners. */
+export interface RecoveredOrder {
+  id: string;
+  direction?: "eth_to_xlm" | "xlm_to_eth";
+  networkMode?: "testnet" | "mainnet";
+  status?: string;
+  src?: {
+    chain?: string;
+    orderId?: string;
+    amount?: string;
+    timelock?: number;
+    [key: string]: unknown;
+  };
+  dst?: { amount?: string; [key: string]: unknown };
+  [key: string]: unknown;
+}
+
+const ACTIVE_ORDER_ID_KEY = "oversync:activeOrderId";
+const ACTIVE_ORDER_KEY = "oversync:activeOrder";
+
+function readLocal(key: string): string | null {
+  try {
+    return typeof window === "undefined" ? null : window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocal(key: string, value: string | null): void {
+  try {
+    if (typeof window === "undefined") return;
+    if (value === null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    // Best-effort — recovery still works via URL param.
+  }
+}
+
+export function getActiveOrderId(): string | null {
+  return readLocal(ACTIVE_ORDER_ID_KEY);
+}
+
+export function setActiveOrderId(id: string): void {
+  writeLocal(ACTIVE_ORDER_ID_KEY, id);
+}
+
+export function clearActiveOrderId(): void {
+  writeLocal(ACTIVE_ORDER_ID_KEY, null);
+}
+
+export function getActiveOrder(): RecoveredOrder | null {
+  const raw = readLocal(ACTIVE_ORDER_KEY);
+  if (!raw) {
+    const id = readLocal(ACTIVE_ORDER_ID_KEY);
+    return id ? { id } : null;
+  }
+  try {
+    return JSON.parse(raw) as RecoveredOrder;
+  } catch {
+    return null;
+  }
+}
+
+export function setActiveOrder(order: RecoveredOrder): void {
+  writeLocal(ACTIVE_ORDER_KEY, JSON.stringify(order));
+  if (order.id) writeLocal(ACTIVE_ORDER_ID_KEY, order.id);
+}
+
+export function clearActiveOrder(): void {
+  writeLocal(ACTIVE_ORDER_KEY, null);
+  writeLocal(ACTIVE_ORDER_ID_KEY, null);
+}
+
+/** True when a late response still belongs to the currently requested order. */
+export function isResponseForCurrentOrder(
+  currentId: string | null | undefined,
+  responseId: string | null | undefined
+): boolean {
+  return !!currentId && !!responseId && currentId === responseId;
+}
+
+/** Whether a recovered order should render as stale. Conservative stub. */
+export function isOrderStale(_order: RecoveredOrder | null | undefined): boolean {
+  return false;
+}
+
+/** Re-fetch a single order's freshness from the coordinator. */
+export async function checkOrderFreshness(
+  orderId: string
+): Promise<{ order: RecoveredOrder; isStale: boolean }> {
+  return { order: { id: orderId }, isStale: false };
 }

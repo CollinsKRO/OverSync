@@ -7,6 +7,12 @@ export interface BackendStatusState {
   lastChecked: Date | null;
   errorMessage: string | null;
   retry: () => void;
+  /** True when the coordinator is reachable. */
+  isReady: boolean;
+  /** True while the first health check is in flight. */
+  isLoading: boolean;
+  /** Re-run the health check. Alias of `retry`. */
+  refresh: () => void;
 }
 
 const POLL_INTERVAL_MS = 60_000;
@@ -27,7 +33,7 @@ export function useBackendStatus(): BackendStatusState {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
-    const requestId = ++requestIdRef;
+    const requestId = ++requestIdRef.current;
     const timerId = window.setTimeout(() => controller.abort(), TIMEOUT_MS);
 
     setStatus('checking');
@@ -78,5 +84,13 @@ export function useBackendStatus(): BackendStatusState {
     };
   }, [check]);
 
-  return { status, lastChecked, errorMessage, retry: check };
+  return {
+    status,
+    lastChecked,
+    errorMessage,
+    retry: check,
+    isReady: status === "reachable",
+    isLoading: status === "checking",
+    refresh: check
+  };
 }

@@ -1,8 +1,15 @@
 import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, beforeAll, afterAll, afterEach } from "vitest";
 import { generateSecret, hashSecret, hashOrderPreimage, verifyPreimage } from "@oversync/sdk/secrets";
-import { EvmHtlcSim, SorobanHtlcSim, type HtlcSim } from "./sim.js";
-import { startEvmFixture, type RealEvmHtlcFixture } from "./evm-fixture.js";
+import {
+  EvmHtlcSim,
+  SorobanHtlcSim,
+  DEFAULT_ESCROW_AMOUNT,
+  assertEscrowReleasedTogether,
+  OneSidedReleaseError,
+  type HtlcSim
+} from "./sim.js";
+import { startEvmFixture, ESCROW_AMOUNT, HARDHAT_TEST_KEYS, type RealEvmHtlcFixture } from "./evm-fixture.js";
 
 const TIMELOCK_SECONDS = 600;
 const PAST_TIMELOCK = TIMELOCK_SECONDS + 1;
