@@ -138,7 +138,11 @@ jobs:
         continue-on-error: true
 
       - name: Pin ed25519-dalek to 2.x
-        run: cargo update -p ed25519-dalek --precise 2.2.0 || echo "ed25519-dalek already at 2.x, continuing"
+        run: |
+          cargo update -p ed25519-dalek@3.0.0 --precise 2.2.0 \
+            || cargo update -p ed25519-dalek --precise 2.2.0 \
+            || echo "ed25519-dalek already at 2.x, continuing"
+          cargo tree -i ed25519-dalek@3.0.0 && echo "WARNING: 3.x still present" || echo "ed25519-dalek 3.x absent, good"
 
       - name: Build WASM
         run: stellar contract build
@@ -148,12 +152,13 @@ jobs:
       # incompatible with the rand_chacha 0.3 ChaCha20Rng the crate's testutils
       # pass to SigningKey::generate, so the test build fails. Cargo does not
       # unify an open range with a manifest pin, so force the 2.x line in the
-      # resolved graph. soroban/Cargo.lock is gitignored, hence generating it
-      # first.
+      # resolved graph.
       - name: Pin ed25519-dalek to the 2.x line
         run: |
-          cargo generate-lockfile
-          cargo update -p ed25519-dalek --precise 2.2.0 || echo "ed25519-dalek already at 2.x, continuing"
+          cargo update -p ed25519-dalek@3.0.0 --precise 2.2.0 \
+            || cargo update -p ed25519-dalek --precise 2.2.0 \
+            || echo "ed25519-dalek already at 2.x, continuing"
+          cargo tree -i ed25519-dalek@3.0.0 && echo "WARNING: 3.x still present" || echo "ed25519-dalek 3.x absent, good"
 
       - name: Run unit tests
         run: cargo test --release
