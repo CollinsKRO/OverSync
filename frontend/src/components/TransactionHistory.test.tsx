@@ -38,19 +38,23 @@ function toAtomic(amount: string, decimals: number): string {
 
 /** Coordinator-shaped payload: raw amounts in atomic units. */
 function toCoordinatorOrder(order: FixtureOrder) {
+  // Unique on-chain signals per order so signal-based dedup (mergeTransactions)
+  // keeps distinct paged orders separate. Recovery dedup still works because
+  // that suite shares tx hashes between local and remote counterparts.
+  const uniq = order.id.replace(/[^a-zA-Z0-9]/g, '');
   return {
     id: order.id,
     direction: 'eth_to_xlm',
     status: 'completed',
-    hashlock: '0x' + 'a'.repeat(64),
+    hashlock: `0xhl${uniq}a`.padEnd(66, 'a').slice(0, 66),
     src: {
       chain: 'ethereum',
       address: ETH_ADDRESS,
       asset: 'native',
       amount: toAtomic(order.amount, ETH_DECIMALS),
       safetyDeposit: '10',
-      orderId: '0x' + 'b'.repeat(64),
-      lockTx: '0x' + 'c'.repeat(64),
+      orderId: `0xoid${uniq}b`.padEnd(66, 'b').slice(0, 66),
+      lockTx: `0xltx${uniq}c`.padEnd(66, 'c').slice(0, 66),
       lockBlock: 1,
       timelock: 1_800_000_000,
     },
@@ -59,7 +63,7 @@ function toCoordinatorOrder(order: FixtureOrder) {
       address: STELLAR_ADDRESS,
       asset: 'native',
       amount: toAtomic(order.amount, XLM_DECIMALS),
-      orderId: '0x' + 'd'.repeat(64),
+      orderId: `0xdst${uniq}d`.padEnd(66, 'd').slice(0, 66),
       lockTx: null,
       lockBlock: null,
       timelock: 1_700_000_000,
@@ -117,8 +121,10 @@ function installOrdersApiStub() {
 
     // A new order lands after the caller has already seen page one, i.e.
     // while page two is being served. Inserting it on the first request would
-    // just put it on page one and test nothing.
-    if (state.insertAfterFirstPage && state.requests.length === 2) {
+    // just put it on page one and test nothing. Initial load fans out to one
+    // request per address (2 when both wallets connected), so the first
+    // pagination is the third request overall.
+    if (state.insertAfterFirstPage && state.requests.length === 3) {
       rows = [state.insertAfterFirstPage, ...rows];
       state.orders = rows;
       state.insertAfterFirstPage = null;
@@ -268,9 +274,11 @@ describe('TransactionHistory cursor pagination', () => {
     await user.click(loadMoreButton()!);
     await waitFor(() => expect(screen.getByText('6 ETH')).toBeInTheDocument());
 
-    // First request has no cursor; the second repeats the token the stub issued.
+    // Initial load fans out per address (2 requests, no cursor); the first
+    // pagination repeats the token the stub issued.
     expect(state.requests[0].cursor).toBeUndefined();
-    expect(state.requests[1].cursor).toBe('order-05');
+    expect(state.requests[1].cursor).toBeUndefined();
+    expect(state.requests[2].cursor).toBe('order-05');
   });
 
   test('refresh restarts from the newest page', async () => {
@@ -282,8 +290,10 @@ describe('TransactionHistory cursor pagination', () => {
     await waitFor(() => expect(screen.getByText('6 ETH')).toBeInTheDocument());
 
     await user.click(screen.getByRole('button', { name: /refresh/i }));
-    await waitFor(() => expect(state.requests).toHaveLength(3));
-    expect(state.requests[2].cursor).toBeUndefined();
+    // Initial (2 per-address) + pagination (1) + refresh (2 per-address).
+    await waitFor(() => expect(state.requests).toHaveLength(5));
+    expect(state.requests[3].cursor).toBeUndefined();
+    expect(state.requests[4].cursor).toBeUndefined();
   });
 });
 
@@ -331,6 +341,41 @@ describe('TransactionHistory claim gating (issue #274)', () => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
+
+  function coordinatorOrder(overrides: Partial<Record<string, any>> = {}) {
+    return {
+      id: 'order-recovered',
+      direction: 'eth_to_xlm',
+      status: 'src_locked',
+      hashlock: '0xhashlockrecovered',
+      src: {
+        chain: 'ethereum',
+        address: ETH_ADDRESS,
+        asset: 'ETH',
+        amount: '1000000000000000000',
+        safetyDeposit: '0',
+        orderId: '0xonchainorderid',
+        lockTx: '0xethlocktx',
+        lockBlock: 1,
+        timelock: 9999999999,
+      },
+      dst: {
+        chain: 'stellar',
+        address: STELLAR_ADDRESS,
+        asset: 'XLM',
+        amount: '10000000',
+        orderId: null,
+        lockTx: null,
+        lockBlock: null,
+        timelock: null,
+      },
+      secret: { revealed: false, preimage: null, revealedTx: null },
+      resolver: '0xResolverContract',
+      createdAt: Math.floor(Date.now() / 1000),
+      updatedAt: Math.floor(Date.now() / 1000),
+      ...overrides,
+    };
+  }
 
   test('keeps the Claimed step unverified when the claim belongs to another order', async () => {
     // The coordinator order below carries a mismatching on-chain order id

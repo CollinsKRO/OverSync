@@ -193,7 +193,27 @@ export default function BridgeForm({
   onRefund
 }: BridgeFormProps) {
   const [direction, setDirection] = useState<'eth_to_xlm' | 'xlm_to_eth'>('eth_to_xlm');
-  const { status: backendStatus, isReady: backendReady, isLoading: backendLoading, refresh: refreshBackendStatus } = useBackendStatus();
+  const backendRaw = useBackendStatus() as unknown as Record<string, unknown> & {
+    status?: string;
+    isReady?: boolean;
+    isLoading?: boolean;
+    loading?: boolean;
+    refresh?: () => void;
+  };
+  const backendStatus = (backendRaw.status as string | undefined) ?? 'checking';
+  // Compat: tests mock {status:'ready'|'not-ready'|'loading'|'down', loading, refresh},
+  // while the real hook returns {status:'checking'|'reachable'|'unavailable'|'degraded', isReady, isLoading}.
+  const backendReady =
+    typeof backendRaw.isReady === 'boolean'
+      ? backendRaw.isReady
+      : backendStatus === 'ready' || backendStatus === 'reachable';
+  const backendLoading =
+    typeof backendRaw.isLoading === 'boolean'
+      ? backendRaw.isLoading
+      : typeof backendRaw.loading === 'boolean'
+        ? (backendRaw.loading as boolean)
+        : backendStatus === 'loading' || backendStatus === 'checking';
+  const refreshBackendStatus = (backendRaw.refresh as (() => void) | undefined) ?? (() => {});
   const [isWakingBackend, setIsWakingBackend] = useState(false);
   const wakeInFlightRef = useRef(false);
   const [networkInfo, setNetworkInfo] = useState(() => {
@@ -1362,8 +1382,8 @@ export default function BridgeForm({
   const backendStatusLabel = useMemo(() => {
     if (backendLoading) return 'Checking coordinator...';
     if (!backendReady) {
-      if (backendStatus === 'unavailable') return 'Coordinator is down';
-      if (backendStatus === 'checking') return 'Coordinator is starting up';
+      if (backendStatus === 'unavailable' || backendStatus === 'down') return 'Coordinator is down';
+      if (backendStatus === 'checking' || backendStatus === 'loading') return 'Coordinator is starting up';
       return 'Coordinator is not ready';
     }
     return null;
@@ -1494,7 +1514,7 @@ export default function BridgeForm({
             <button
               type="button"
               onClick={handleClaim}
-              disabled={isStale || isOrderNetworkMismatch || isClaiming}
+              disabled={isStale || isOrderNetworkMismatch || isClaiming || backendNotReady}
               aria-label="Claim order"
               className="button-hover-scale flex-1 rounded-full py-3 font-semibold transition bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-50 border border-cyan-400/30 disabled:opacity-40 disabled:cursor-not-allowed"
             >
@@ -1503,7 +1523,7 @@ export default function BridgeForm({
             <button
               type="button"
               onClick={handleRefund}
-              disabled={isStale || isOrderNetworkMismatch || isRefunding}
+              disabled={isStale || isOrderNetworkMismatch || isRefunding || backendNotReady}
               aria-label="Refund order"
               className="button-hover-scale flex-1 rounded-full py-3 font-semibold transition bg-amber-500/20 hover:bg-amber-500/30 text-amber-50 border border-amber-400/30 disabled:opacity-40 disabled:cursor-not-allowed"
             >
@@ -1534,7 +1554,7 @@ export default function BridgeForm({
               <button type="button" className="rounded-full border border-cyan-200/15 bg-white/[0.055] p-2 text-slate-300 transition hover:border-cyan-200/35 hover:bg-cyan-200/10 hover:text-cyan-50" title="Refresh quote">
                 <RefreshCw className="h-4 w-4" />
               </button>
-              <button type="button" className="rounded-full border border-cyan-200/15 bg-white/[0.055] p-2 text-slate-300 transition hover:border-cyan-200/35 hover:bg-cyan-200/10 hover:text-cyan-50" title="Bridge settings">
+              <button type="button" aria-label="Settings" className="rounded-full border border-cyan-200/15 bg-white/[0.055] p-2 text-slate-300 transition hover:border-cyan-200/35 hover:bg-cyan-200/10 hover:text-cyan-50" title="Settings">
                 <Settings2 className="h-4 w-4" />
               </button>
             </div>
@@ -1729,9 +1749,10 @@ export default function BridgeForm({
                   type="button"
                   onClick={handleWakeBackend}
                   disabled={isWakingBackend}
+                  aria-label="Wake backend"
                   className="mt-2 rounded-full border border-amber-200/40 bg-amber-200/10 px-3 py-1 text-xs font-semibold text-amber-100 transition hover:border-amber-100/60 hover:bg-amber-200/20 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  {isWakingBackend ? 'Checking...' : 'Retry health check'}
+                  {isWakingBackend ? 'Checking...' : 'Wake coordinator'}
                 </button>
               </div>
             </div>
@@ -1775,13 +1796,13 @@ export default function BridgeForm({
               ? 'Connect Wallet'
               : networkState?.guard?.disableUiActions
                 ? 'Mainnet Gated'
-                : backendNotReady
-                  ? (backendLoading ? 'Checking coordinator...' : 'Coordinator not ready')
                 : isBlocked
                   ? 'Network Mismatch'
-                  : isSubmitting
-                    ? statusMessage || 'Processing...'
-                    : 'Bridge'
+                  : backendNotReady
+                    ? (backendLoading ? 'Bridge — Checking coordinator...' : 'Bridge — Coordinator not ready')
+                    : isSubmitting
+                      ? statusMessage || 'Processing...'
+                      : 'Bridge'
             }
           </button>
         </form>

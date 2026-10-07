@@ -54,7 +54,7 @@ export default function LaunchReadinessSurface() {
           <TestnetTractionCard />
         </div>
 
-        <AuditGateTimeline orderId="launch-readiness" />
+        <AuditGateTimeline />
 
         <footer className="mt-10 rounded-xl border border-white/10 bg-white/[0.03] p-5 text-sm leading-6 text-slate-300/90">
           <div className="flex items-start gap-3">

@@ -106,7 +106,9 @@ export function buildPublicOrderEvidence(order: unknown): PublicOrderEvidence {
 
   const txHashes = collectPublicTxHashes(raw);
 
-  const timestamps = raw.timestamps ?? {};
+  const timestamps =
+    (raw.timestamps as { createdAt?: unknown; updatedAt?: unknown } | undefined) ??
+    { createdAt: raw.createdAt, updatedAt: raw.updatedAt };
   const createdAt = typeof timestamps.createdAt === 'number' ? timestamps.createdAt : null;
   const updatedAt = typeof timestamps.updatedAt === 'number' ? timestamps.updatedAt : null;
 

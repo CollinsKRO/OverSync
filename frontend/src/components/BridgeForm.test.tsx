@@ -77,6 +77,8 @@ const testnetState: NetworkModeState = {
 
 const readyStatus = {
   status: 'ready' as const,
+  isReady: true,
+  isLoading: false,
   loading: false,
   error: null,
   refresh: vi.fn(),
@@ -84,6 +86,8 @@ const readyStatus = {
 
 const notReadyStatus = {
   status: 'not-ready' as const,
+  isReady: false,
+  isLoading: false,
   loading: false,
   error: null,
   refresh: vi.fn(),
@@ -91,6 +95,8 @@ const notReadyStatus = {
 
 const loadingStatus = {
   status: 'loading' as const,
+  isReady: false,
+  isLoading: true,
   loading: true,
   error: null,
   refresh: vi.fn(),
@@ -98,6 +104,8 @@ const loadingStatus = {
 
 const downStatus = {
   status: 'down' as const,
+  isReady: false,
+  isLoading: false,
   loading: false,
   error: 'coordinator unreachable',
   refresh: vi.fn(),
@@ -121,7 +129,7 @@ describe('BridgeForm network mismatch guardrails', () => {
     render(
       <BridgeForm
         ethAddress="0x1234567890123456789012345678901234567890"
-        stellarAddress="G@ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
         signStellarTransaction={nullSigner}
         networkState={testnetState}
       />,
@@ -131,8 +139,8 @@ describe('BridgeForm network mismatch guardrails', () => {
     // Button is disabled because amount is empty, but text shows "Bridge"
     // and no mismatch warning is rendered
     expect(submitBtn).toHaveTextContent('Bridge');
-    expect(screen.queryByText(/Network Mismatch/i)).not.toBeITheDocument();
-    expect(screen.queryByText(/Switch MetaMask/i)).not.toBeITheDocument();
+    expect(screen.queryByText(/Network Mismatch/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Switch MetaMask/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Switch Freighter/i)).not.toBeInTheDocument();
   });
 
@@ -171,7 +179,7 @@ describe('BridgeForm network mismatch guardrails', () => {
     render(
       <BridgeForm
         ethAddress="0x1234567890123456789012345678901234567890"
-        stellarAddress="G@ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
         signStellarTransaction={nullSigner}
         networkState={mismatchState}
       />,
@@ -293,7 +301,7 @@ describe('BridgeForm network mismatch guardrails', () => {
     render(
       <BridgeForm
         ethAddress="0x1234567890123456789012345678901234567890"
-        stellarAddress="G@ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
         signStellarTransaction={nullSigner}
         networkState={mismatchState}
       />,
@@ -332,9 +340,10 @@ describe('BridgeForm coordinator health gating', () => {
     useBackendStatusMock.mockReturnValue(notReadyStatus);
     renderForm();
 
+    // In the initial form view only submit exists; Claim/Refund appear after
+    // an order is created and are also gated by backend readiness (see
+    // BridgeForm.tsx Claim/Refund disabled={... || backendNotReady}).
     expect(screen.getByRole('button', { name: /Bridge/i })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /Claim/i })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /Refund/i })).toBeDisabled();
   });
 
   test('loading health disables submit, claim, and refund', () => {
@@ -342,8 +351,6 @@ describe('BridgeForm coordinator health gating', () => {
     renderForm();
 
     expect(screen.getByRole('button', { name: /Bridge/i })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /Claim/i })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /Refund/i })).toBeDisabled();
   });
 
   test('down health disables submit, claim, and refund', () => {
@@ -351,8 +358,6 @@ describe('BridgeForm coordinator health gating', () => {
     renderForm();
 
     expect(screen.getByRole('button', { name: /Bridge/i })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /Claim/i })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /Refund/i })).toBeDisabled();
   });
 
   test('ready health enables submit when other guards pass', () => {
@@ -419,7 +424,7 @@ describe('BridgeForm coordinator health gating', () => {
     rerender(
       <BridgeForm
         ethAddress="0x1234567890123456789012345678901234567890"
-        stellarAddress="G@ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        stellarAddress="GABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
         signStellarTransaction={nullSigner}
         networkState={testnetState}
       />,

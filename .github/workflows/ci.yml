@@ -106,30 +106,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned deliberately. `@stable` resolves to a toolchain that rejects
-      # ethnum 1.5.0 (pinned by stellar-cli 22.8.1's own lockfile, which we keep
-      # via --locked): rustc nightly-2026-04-18 grew `TryFromIntError` from 0 to
-      # 1 byte, so ethnum's `transmute(())` fails with E0512.
-      #
-      # The floor is 1.84, the first release with the `wasm32v1-none` target
-      # that `stellar contract build` requires. Staying below ~1.97 keeps the
-      # `TryFromIntError` layout ethnum expects.
-      #
-      # To move off this pin: upgrade stellar-cli past 22.8.1 to a release whose
-      # lockfile uses ethnum >= 1.5.3, then return to `@stable`.
+      # Toolchain 1.89.0 satisfies darling 0.24.1 / syn 3.x (MSRV 1.88) pulled
+      # via soroban-sdk 22 -> stellar-xdr -> serde_with 3.24.0, while our
+      # workspace ethnum is already at 1.5.3 (E0512 transmute fix). stellar-cli
+      # is installed via binstall (prebuilt binary, no compilation) at a
+      # release whose lockfile uses ethnum >= 1.5.3.
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
+          toolchain: 1.89.0
           targets: wasm32-unknown-unknown,wasm32v1-none
-
-      # Install the released binary instead of `cargo install`: stellar-cli
-      # 22.8.1 depends on ethnum 1.5.0, which no longer compiles under current
-      # stable Rust (E0512 transmute size check).
-      - name: Install Stellar CLI
-        run: |
-          cargo install --locked stellar-cli --version 22.8.1
-          stellar --version
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -138,14 +124,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             soroban/target
-          key: soroban-${{ runner.os }}-${{ hashFiles('soroban/Cargo.toml', 'soroban/contracts/**/Cargo.toml') }}
+          key: soroban-${{ runner.os }}-${{ hashFiles('soroban/Cargo.toml', 'soroban/Cargo.lock', 'soroban/contracts/**/Cargo.toml') }}
 
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
 
       - name: Install Stellar CLI
         run: |
-          cargo binstall -y stellar-cli --version 22.8.1
+          cargo binstall -y stellar-cli --version 23.4.1
           stellar --version
       - name: Who needs ed25519-dalek 3.0.0
         run: cargo tree -i ed25519-dalek@3.0.0

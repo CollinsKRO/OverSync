@@ -10,7 +10,6 @@ import { buildHtlcReceipt } from '../lib/parseHtlcReceipt';
 import {
   buildHistoryQuery,
   historyErrorFromResponse,
-  mergeHistoryPage,
   readHistoryPage,
 } from '../lib/orderHistoryCursor';
 import type { Address } from 'viem';
@@ -19,6 +18,7 @@ import {
   isRealHash,
   isRealTransaction,
   mapCoordinatorOrderToTransaction,
+  mergeTransactions,
   type Transaction,
 } from '../lib/orderRecovery';
 
@@ -118,6 +118,66 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
 
     setIsLoading(true);
     try {
+      // Initial load: one request per connected address using the
+      // coordinator's `address` param (matches either side). This is what
+      // lets recovery work after a reload and tolerates one side failing.
+      // Pagination (cursor !== null) uses the single cursor flow.
+      if (cursor === null) {
+        const targets = [ethAddress, stellarAddress].filter(
+          (a): a is string => Boolean(a)
+        );
+        const network = isTestnet() ? 'testnet' : 'mainnet';
+        const settled = await Promise.allSettled(
+          targets.map(async (address) => {
+            const params = new URLSearchParams({
+              address,
+              network,
+              limit: String(HISTORY_PAGE_SIZE),
+            });
+            const res = await fetch(`${API_BASE_URL}/api/orders/history?${params.toString()}`);
+            const body = await res.json().catch(() => null);
+            if (!res.ok) throw historyErrorFromResponse(res.status, body);
+            return readHistoryPage(body);
+          })
+        );
+        const failures = settled.filter(
+          (s): s is PromiseRejectedResult => s.status === 'rejected'
+        );
+        if (failures.length === settled.length) {
+          throw failures[0].reason;
+        }
+        let next: string | null = null;
+        const allRemote: Transaction[] = [];
+        for (const result of settled) {
+          if (result.status !== 'fulfilled') continue;
+          const page = result.value;
+          if (page.nextCursor) next = page.nextCursor;
+          for (const o of page.orders) {
+            try {
+              const tx = mapCoordinatorOrderToTransaction(o);
+              if (isRealTransaction(tx)) allRemote.push(tx);
+            } catch {
+              // Skip malformed orders; local cache still renders.
+            }
+          }
+        }
+        const local = loadFromStorage();
+        const base =
+          seedFromCache && transactionsRef.current.length > 0
+            ? mergeTransactions(transactionsRef.current, local)
+            : local;
+        const merged = mergeTransactions(base, allRemote);
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+        } catch (err) {
+          console.warn('Could not persist transactions:', err);
+        }
+        commitTransactions(merged);
+        setNextCursor(next);
+        setHistoryError(null);
+        return;
+      }
+
       const query = buildHistoryQuery({
         ethAddress,
         stellarAddress,
@@ -135,15 +195,9 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
         .map(mapCoordinatorOrderToTransaction)
         .filter(isRealTransaction);
 
-      // Keyed by order id, so a row that shifted between pages shows up once.
-      // Earlier pages stay on the list: a page is added, never swapped in.
-      const local = loadFromStorage();
-      const base = seedFromCache
-        ? mergeHistoryPage<Transaction>(transactionsRef.current, local)
-        : transactionsRef.current;
-      const merged = mergeHistoryPage<Transaction>(base, remote).sort(
-        (a, b) => b.timestamp - a.timestamp
-      );
+      // Fold the page into what's on screen; dedupe by hashlock/tx/id so a
+      // locally pending order coalesces with its recovered counterpart.
+      const merged = mergeTransactions(transactionsRef.current, remote);
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
       } catch (err) {
@@ -421,17 +475,6 @@ export default function TransactionHistory({ ethAddress, stellarAddress }: Trans
           </button>
         ))}
       </div>
-
-      {nextCursor && !isLoading && (
-        <button
-          onClick={refreshFromCoordinator}
-          disabled={isLoading}
-          className="button-hover-scale flex items-center justify-center gap-2 rounded-full border border-cyan-200/30 bg-cyan-200/[0.12] px-4 py-2 text-sm font-semibold text-cyan-50 shadow-[0_12px_34px_rgba(0,226,255,0.12)] transition hover:border-cyan-100/45 hover:bg-cyan-200/[0.18] disabled:opacity-60"
-        >
-          <ArrowRight className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
-          Load More
-        </button>
-      )}
 
       <div className="min-h-0 space-y-3 overflow-y-auto overscroll-contain pr-1">
         {filteredTransactions.length === 0 ? (
