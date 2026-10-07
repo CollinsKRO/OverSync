@@ -272,7 +272,7 @@ describe("real EVM HTLCEscrow (Anvil)", () => {
     }, 60_000);
 
    afterAll(async () => {
-    await fixture.stop();
+    await fixture?.stop?.();
 });
     it("deploys and accepts a valid sha256 preimage from @oversync/sdk — order becomes Claimed", async () => {
       const secret = generateSecret();

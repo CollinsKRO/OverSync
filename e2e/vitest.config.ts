@@ -12,7 +12,11 @@ const sdkSrc = path.resolve(here, "../packages/sdk/src");
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["**/*.test.ts"]
+    include: ["**/*.test.ts"],
+    // Each suite spawns its own Hardhat node on 127.0.0.1:8545. Running files
+    // in parallel causes EADDRINUSE; run serially in a single fork.
+    pool: "forks",
+    poolOptions: { forks: { singleFork: true } },
   },
   resolve: {
     alias: [
